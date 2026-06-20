@@ -68,6 +68,7 @@ crates/
 - 稳定版 Rust 工具链
 - 可访问 Git 与 Cargo git 依赖
 - 首次构建时可访问 GitHub Release
+- macOS 默认启用 GPUI runtime shader，可用 Xcode Command Line Tools 构建；仅在关闭 `gpui_platform/runtime_shaders`、改回构建期预编译 Metal shader 时才需要完整 Xcode 的 `xcrun metal`
 
 首次构建时，`crates/air-desktop/build.rs` 会为当前 target 下载对应的 `mihomo` 压缩包与常用 geodata，并缓存到仓库根目录下被忽略的 `mihomo/` 目录。运行时会再将这些资源释放到应用工作目录。
 
@@ -85,6 +86,24 @@ cargo run -p air-desktop --bin air
 ```powershell
 $env:AIR_FORCE_MIHOMO_DOWNLOAD = "1"
 cargo check
+```
+
+macOS 上构建并启动过 Air 一次后，可以运行 TUN 验收脚本。该脚本会使用真实落盘的 `mihomo` 和配置，触发系统管理员授权启动核心，检查 `external-controller` 与 `utun` 网卡，最后再授权停止核心：
+
+```bash
+./scripts/verify-macos-tun.sh
+```
+
+如果 AppleScript 管理员授权弹窗没有出现在前台，或在自动化终端里一直不返回，可以改用终端 `sudo` 方式输入管理员密码：
+
+```bash
+./scripts/verify-macos-tun.sh --sudo
+```
+
+如果只想确认真实落盘的 macOS 配置和 `mihomo -t` 校验，不触发管理员授权：
+
+```bash
+./scripts/verify-macos-tun.sh --check-only
 ```
 
 ## 运行期文件
@@ -120,9 +139,10 @@ macOS / Linux 当前仍缺少完整的：
 
 - 托盘与系统通知
 - 自启动
-- TUN 权限处理
 - 服务化托管
 - 面向终端用户的打包发布流程
+
+macOS 当前支持基础 TUN 启动路径：默认配置不固定 `device`，由 mihomo 自动分配可用 `utun`，同时使用 `auto-route: true`、`auto-redirect: false`，并将 `external-controller` 设为 `127.0.0.1:19090` 以避开常见本机代理控制端口占用。普通 GUI 启动核心时会通过系统管理员授权单独提权启动 mihomo。该路径尚未服务化，停止核心依赖 GUI 进程持有的 PID 跟踪；若普通权限无法向 root mihomo 发送停止信号，会再次请求管理员授权完成停止。
 
 ## CI / 发布现状
 

@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 use air_error::{AppResult, PlatformError};
 
-use super::types::{CORE_SERVICE_ARG, CoreServicePaths, SERVICE_OWNER_PID_ARG};
+#[cfg(any(windows, test))]
+use super::types::SERVICE_OWNER_PID_ARG;
+use super::types::{CORE_SERVICE_ARG, CoreServicePaths};
 pub fn service_binary_args(paths: &CoreServicePaths) -> AppResult<Vec<String>> {
     let exe = std::env::current_exe().map_err(|error| {
         PlatformError::OperationFailed(format!("读取当前程序路径失败: {error}"))
@@ -19,6 +19,7 @@ pub fn service_binary_args(paths: &CoreServicePaths) -> AppResult<Vec<String>> {
     ])
 }
 
+#[cfg(any(windows, test))]
 pub(super) fn service_start_args(owner_pid: u32) -> Vec<String> {
     vec![SERVICE_OWNER_PID_ARG.to_string(), owner_pid.to_string()]
 }
@@ -46,6 +47,7 @@ pub(super) unsafe fn service_args_from_argv(argc: u32, argv: *mut *mut u16) -> V
         .collect()
 }
 
+#[cfg(any(windows, test))]
 pub(super) fn service_owner_pid_from_args(args: &[String]) -> Option<u32> {
     args.windows(2).find_map(|pair| {
         (pair[0] == SERVICE_OWNER_PID_ARG)
@@ -54,7 +56,10 @@ pub(super) fn service_owner_pid_from_args(args: &[String]) -> Option<u32> {
             .filter(|pid| *pid > 0)
     })
 }
+#[cfg(windows)]
 pub(super) fn service_paths_from_args() -> AppResult<CoreServicePaths> {
+    use std::path::PathBuf;
+
     let mut config_dir = None;
     let mut data_dir = None;
     let mut cache_dir = None;

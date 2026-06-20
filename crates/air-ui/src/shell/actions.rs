@@ -26,17 +26,25 @@ impl Shell {
                 );
             }
         }
-        let finished_config_save = match &event {
-            AppEvent::CommandFinished { id } => {
-                matches!(
+        let finished_config_save_id = match &event {
+            AppEvent::CommandFinished { id }
+                if matches!(
                     self.pending_commands.get(id),
                     Some(AppCommand::SaveConfig { .. })
-                )
+                ) =>
+            {
+                Some(*id)
             }
-            _ => false,
+            _ => None,
         };
         let cleared_pending = match &event {
-            AppEvent::CommandFinished { id } => self.pending_commands.remove(id).is_some(),
+            AppEvent::CommandFinished { id } => {
+                let removed = self.pending_commands.remove(id).is_some();
+                if let Some(command) = self.pending_after_config_save.remove(id) {
+                    self.dispatch_command(command);
+                }
+                removed
+            }
             _ => false,
         };
         let should_refresh_groups = matches!(
@@ -63,7 +71,7 @@ impl Shell {
             self.reconcile_traffic_monitoring();
             self.reconcile_log_monitoring_focus();
             self.reconcile_connections_monitoring_focus();
-            if finished_config_save {
+            if finished_config_save_id.is_some() {
                 self.refresh_status_tun_enabled_from_saved_config();
             }
             if should_refresh_groups {
@@ -400,7 +408,15 @@ impl Shell {
 
         match result {
             Ok(profile) => {
-                self.dispatch_command(AppCommand::SaveConfig { profile });
+                let after_save = if enabled {
+                    super::lifecycle::command_after_tun_config_save(&self.snapshot.runtime)
+                } else {
+                    None
+                };
+                self.dispatch_command_after_config_save(
+                    AppCommand::SaveConfig { profile },
+                    after_save,
+                );
                 true
             }
             Err(error) => {

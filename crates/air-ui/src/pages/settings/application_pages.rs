@@ -259,6 +259,54 @@ fn application_page(
 ) -> SettingPage {
     let settings = model.settings;
 
+    let mut startup_items = vec![
+        app_switch_item(
+            "恢复上次窗口",
+            "记录窗口大小、位置和最大化状态。",
+            settings.restore_window,
+            SettingsBoolField::RestoreWindow,
+            shell.clone(),
+            palette,
+        ),
+        app_switch_item(
+            "启动后自动拉起核心",
+            "应用启动后自动启动 mihomo 核心。",
+            settings.start_core_after_launch,
+            SettingsBoolField::StartCoreAfterLaunch,
+            shell.clone(),
+            palette,
+        ),
+    ];
+    if cfg!(target_os = "windows") {
+        startup_items.push(core_service_switch_item(core_service, shell.clone()));
+    }
+    startup_items.extend([
+        app_switch_item(
+            "开机自启",
+            "系统登录后自动启动 Air。",
+            settings.autostart,
+            SettingsBoolField::Autostart,
+            shell.clone(),
+            palette,
+        ),
+        app_switch_item(
+            "静默启动",
+            "软件启动时直接隐藏到托盘。",
+            settings.silent_start,
+            SettingsBoolField::SilentStartup,
+            shell.clone(),
+            palette,
+        ),
+        app_switch_item(
+            "隐藏到托盘",
+            "点击窗口关闭按钮时隐藏主窗口，不退出应用。",
+            settings.close_window_behavior == CloseWindowBehavior::Tray,
+            SettingsBoolField::HideToTray,
+            shell.clone(),
+            palette,
+        ),
+    ]);
+
     hide_setting_page_header(SettingPage::new(UnifiedSettingsPage::Application.title()))
         .icon(ComponentIcon::new(
             UnifiedSettingsPage::Application.sidebar_icon(),
@@ -271,49 +319,7 @@ fn application_page(
                 theme_choice_item(settings.theme, shell.clone(), palette),
                 readonly_value_item("语言", AppLanguage::ZhCn.label(), Icon::Languages, palette),
             ]),
-            SettingGroup::new().title("启动").items(vec![
-                app_switch_item(
-                    "恢复上次窗口",
-                    "记录窗口大小、位置和最大化状态。",
-                    settings.restore_window,
-                    SettingsBoolField::RestoreWindow,
-                    shell.clone(),
-                    palette,
-                ),
-                app_switch_item(
-                    "启动后自动拉起核心",
-                    "应用启动后自动启动 mihomo 核心。",
-                    settings.start_core_after_launch,
-                    SettingsBoolField::StartCoreAfterLaunch,
-                    shell.clone(),
-                    palette,
-                ),
-                core_service_switch_item(core_service, shell.clone()),
-                app_switch_item(
-                    "开机自启",
-                    "系统登录后自动启动 Air。",
-                    settings.autostart,
-                    SettingsBoolField::Autostart,
-                    shell.clone(),
-                    palette,
-                ),
-                app_switch_item(
-                    "静默启动",
-                    "软件启动时直接隐藏到托盘。",
-                    settings.silent_start,
-                    SettingsBoolField::SilentStartup,
-                    shell.clone(),
-                    palette,
-                ),
-                app_switch_item(
-                    "隐藏到托盘",
-                    "点击窗口关闭按钮时隐藏主窗口，不退出应用。",
-                    settings.close_window_behavior == CloseWindowBehavior::Tray,
-                    SettingsBoolField::HideToTray,
-                    shell,
-                    palette,
-                ),
-            ]),
+            SettingGroup::new().title("启动").items(startup_items),
             SettingGroup::new().title("其他").items(vec![app_input_item(
                 "测速地址",
                 inputs.proxy_delay_test_url,

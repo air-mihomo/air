@@ -219,7 +219,7 @@ where
         }
         request = request.header(
             USER_AGENT,
-            subscription_download_user_agent(self.core_version.as_deref()),
+            source_subscription_user_agent(source, self.core_version.as_deref()),
         );
 
         if let Some(previous) = previous {
@@ -668,6 +668,19 @@ fn subscription_download_user_agent(core_version: Option<&str>) -> String {
     format!("clash.meta/v{version}")
 }
 
+fn source_subscription_user_agent(
+    source: &SubscriptionSource,
+    core_version: Option<&str>,
+) -> String {
+    source
+        .user_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| subscription_download_user_agent(core_version))
+}
+
 fn parse_subscription_user_info(value: &str) -> Option<SubscriptionUserInfo> {
     let mut info = SubscriptionUserInfo::default();
     for part in value.split(';') {
@@ -981,8 +994,10 @@ proxies:
         )
         .with_core_version(Some("1.20.1".to_string()));
 
+        let mut source = source(server.url.clone());
+        source.user_agent = None;
         let report = pipeline
-            .update(&source(server.url.clone()))
+            .update(&source)
             .await
             .expect("subscription should update");
 

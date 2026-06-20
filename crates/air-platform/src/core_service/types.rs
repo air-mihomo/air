@@ -6,9 +6,13 @@ use air_error::AppResult;
 pub const CORE_SERVICE_NAME: &str = "AirMihomoCore";
 pub const CORE_SERVICE_DISPLAY_NAME: &str = "Air Mihomo Core Service";
 pub(super) const CORE_SERVICE_ARG: &str = "--air-mihomo-service";
+#[cfg(windows)]
 pub(super) const ELEVATED_SERVICE_HELPER_ARG: &str = "--air-elevated-service-helper";
+#[cfg(any(windows, test))]
 pub(super) const SERVICE_OWNER_PID_ARG: &str = "--owner-pid";
+#[cfg(windows)]
 pub(super) const SERVICE_ADMIN_RIGHTS_SDDL: &str = "CCDCLCSWRPWPDTLOCRSDRCWDWO";
+#[cfg(windows)]
 pub(super) const SERVICE_INTERACTIVE_USER_RIGHTS_SDDL: &str = "LCRPWP";
 
 // Windows 标准访问位不属于服务模块本身；这里显式保留数值，避免为了少量 ACL 掩码引入额外
@@ -64,6 +68,7 @@ impl CoreServicePaths {
         ))
     }
 
+    #[cfg(windows)]
     pub(super) fn init(&self) -> AppResult<()> {
         for dir in [
             &self.config_dir,
@@ -79,6 +84,7 @@ impl CoreServicePaths {
 }
 
 impl CoreServiceAction {
+    #[cfg(windows)]
     pub(super) fn as_arg(self) -> &'static str {
         match self {
             Self::Install => "--install",
@@ -86,6 +92,7 @@ impl CoreServiceAction {
         }
     }
 
+    #[cfg(windows)]
     pub(super) fn from_arg(value: &str) -> Option<Self> {
         match value {
             "--install" => Some(Self::Install),

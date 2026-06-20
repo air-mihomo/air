@@ -1,12 +1,19 @@
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static APP_QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 pub fn launch(force_start_core: bool, single_instance_events: Receiver<SingleInstanceEvent>) {
     gpui_platform::application()
         .with_assets(icons::AppAssets::new())
         .run(move |cx: &mut App| {
+            reset_app_quit_request();
             gpui_component::init(cx);
+            Theme::global_mut(cx).font_family = super::render::app_ui_font_family().into();
             super::components::enforce_visible_scrollbars(cx);
             super::components::configure_global_notifications(cx);
+            configure_app_menu(cx);
 
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(
@@ -26,6 +33,7 @@ pub fn launch(force_start_core: bool, single_instance_events: Receiver<SingleIns
                         .new(|cx| Shell::new(window, cx, force_start_core, single_instance_events));
                     let shutdown_subscription = shell.update(cx, |_, cx| {
                         cx.on_app_quit(|shell, _| {
+                            shell.request_app_quit();
                             shell.stop_core_before_app_exit();
                             async {}
                         })
@@ -35,19 +43,30 @@ pub fn launch(force_start_core: bool, single_instance_events: Receiver<SingleIns
                     });
                     let close_shell = shell.clone();
                     window.on_window_should_close(cx, move |window, cx| {
+                        if close_shell.read(cx).should_close_window_for_intent() {
+                            close_shell.read(cx).stop_core_before_app_exit();
+                            return true;
+                        }
                         let behavior = close_shell
                             .read(cx)
                             .settings
                             .settings()
                             .close_window_behavior;
+                        if behavior == CloseWindowBehavior::Exit {
+                            let _ = close_shell.update(cx, |shell, _| {
+                                shell.request_app_quit();
+                            });
+                            close_shell.read(cx).stop_core_before_app_exit();
+                            cx.quit();
+                            return false;
+                        }
                         if behavior == CloseWindowBehavior::Tray {
                             let _ = close_shell.update(cx, |shell, cx| {
                                 shell.hide_window_from_tray(window, cx);
                             });
                             return false;
                         }
-                        close_shell.read(cx).stop_core_before_app_exit();
-                        true
+                        false
                     });
                     // gpui-component 的 Root 必须作为窗口第一层，用来承载通知、弹窗和焦点管理。
                     cx.new(|cx| Root::new(shell, window, cx))
@@ -64,6 +83,27 @@ pub(super) fn main_window_titlebar_options() -> gpui::TitlebarOptions {
     let mut options = TitleBar::title_bar_options();
     options.title = Some("Air".into());
     options
+}
+
+pub(super) fn configure_app_menu(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx| {
+        mark_app_quit_requested();
+        cx.quit();
+    });
+    cx.bind_keys([app_quit_key_binding()]);
+    cx.set_menus(app_menus());
+}
+
+pub(super) fn app_quit_key_binding() -> KeyBinding {
+    KeyBinding::new("cmd-q", Quit, None)
+}
+
+pub(super) fn app_menus() -> Vec<Menu> {
+    vec![Menu::new("Air").items([
+        MenuItem::os_submenu("Services", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("退出 Air", Quit),
+    ])]
 }
 
 pub(super) fn create_tray() -> (TrayHandle, Receiver<TrayEvent>) {
@@ -309,6 +349,33 @@ pub(super) fn dispatch_startup_prepare(router: Option<&AppCommandRouter>, start_
 pub(super) fn should_start_core_on_startup(settings: &AppSettings, force_start_core: bool) -> bool {
     // UAC 提权后的新实例必须继续完成用户刚触发的启动动作。
     force_start_core || settings.start_core_after_launch
+}
+
+pub(super) fn should_close_window_for_intent(
+    settings: &AppSettings,
+    app_quit_requested: bool,
+) -> bool {
+    app_quit_requested || settings.close_window_behavior != CloseWindowBehavior::Tray
+}
+
+pub(super) fn command_after_tun_config_save(runtime: &RuntimeStatus) -> Option<AppCommand> {
+    match runtime {
+        RuntimeStatus::Running => Some(AppCommand::RestartCore),
+        RuntimeStatus::Idle | RuntimeStatus::Failed { .. } => Some(AppCommand::StartCore),
+        RuntimeStatus::Starting | RuntimeStatus::Stopping => None,
+    }
+}
+
+pub(super) fn reset_app_quit_request() {
+    APP_QUIT_REQUESTED.store(false, Ordering::SeqCst);
+}
+
+pub(super) fn mark_app_quit_requested() {
+    APP_QUIT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub(super) fn app_quit_requested() -> bool {
+    APP_QUIT_REQUESTED.load(Ordering::SeqCst)
 }
 
 pub(super) fn should_hide_window_on_startup(settings: &AppSettings, tray_supported: bool) -> bool {

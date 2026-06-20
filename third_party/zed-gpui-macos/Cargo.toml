@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/gpui_macos"]
+resolver = "3"
+
+[workspace.package]
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.dependencies]
+anyhow = "1.0.86"
+cocoa = "=0.26.0"
+collections = { git = "https://github.com/zed-industries/zed", package = "collections" }
+core-foundation = "=0.10.0"
+core-foundation-sys = "0.8.6"
+core-video = { version = "0.5.2", features = ["metal"] }
+ctor = "0.4.0"
+derive_more = { version = "2.1.1", features = [
+    "add",
+    "constructor",
+    "deref",
+    "display",
+    "from",
+    "into",
+    "try_into",
+] }
+futures = "0.3.32"
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui", default-features = false }
+image = "0.25.1"
+itertools = "0.14.0"
+libc = "0.2"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+mach2 = "0.5"
+media = { git = "https://github.com/zed-industries/zed", package = "media" }
+metal = "0.33"
+objc = "0.2"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSGraphics"] }
+parking_lot = "0.12.1"
+semver = { version = "1.0", features = ["serde"] }
+smallvec = "1.13.2"
+strum = { version = "0.27.2", features = ["derive"] }
+util = { git = "https://github.com/zed-industries/zed", package = "util" }
+uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }

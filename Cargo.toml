@@ -11,6 +11,7 @@ members = [
     "crates/air-telemetry",
     "crates/air-error",
 ]
+exclude = ["third_party/zed-gpui-macos"]
 resolver = "3"
 
 [workspace.package]
@@ -36,7 +37,7 @@ directories = "6"
 futures = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "196b9259b562c26be97c92f88c798bbeefa9cb3d", package = "gpui-component", default-features = false, features = ["tree-sitter-yaml", "tree-sitter-javascript"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "runtime_shaders"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
@@ -61,3 +62,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Services", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[patch."https://github.com/zed-industries/zed"]
+gpui_macos = { path = "third_party/zed-gpui-macos/crates/gpui_macos" }

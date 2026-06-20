@@ -387,6 +387,7 @@ impl AppServices {
             self.shutdown_stop_started.store(false, Ordering::Release);
             return Err(error);
         }
+        self.disable_system_proxy();
         Ok(())
     }
 
@@ -514,10 +515,52 @@ impl AppServices {
         Ok(apply_override_script(&subscription_name, &runtime, script)?)
     }
 
-    fn current_config_enables_tun(&self) -> AppResult<bool> {
+    pub fn current_config_enables_tun(&self) -> AppResult<bool> {
         Ok(document_enables_tun(
             &self.core_config_store.load_user_config()?,
         ))
+    }
+
+    pub fn current_mixed_port(&self) -> AppResult<Option<u32>> {
+        Ok(self.build_effective_runtime_config(None)?.global.mixed_port)
+    }
+
+    pub fn sync_system_proxy_to_current_config(&self) -> AppResult<()> {
+        let Some(port) = self.current_mixed_port()? else {
+            tracing::info!("skipping system proxy sync because mixed-port is not configured");
+            return Ok(());
+        };
+        match air_platform::system_proxy::enable_local_system_proxy(port) {
+            Ok(update) => {
+                tracing::info!(
+                    port,
+                    services = ?update.services,
+                    "system proxy synchronized to mihomo mixed-port"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, port, "failed to synchronize system proxy");
+                self.emit_notification(
+                    AppNotificationLevel::Warning,
+                    format!("系统代理同步失败：{error}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn disable_system_proxy(&self) {
+        match air_platform::system_proxy::disable_system_proxy() {
+            Ok(update) => {
+                tracing::info!(
+                    services = ?update.services,
+                    "system proxy disabled after mihomo stopped"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to disable system proxy after mihomo stopped");
+            }
+        }
     }
 
     fn subscription_merge_inputs(&self) -> AppResult<Vec<SubscriptionMergeInput>> {
@@ -701,7 +744,7 @@ impl MihomoClientFactory {
     pub fn endpoint_from_document(document: Option<&ConfigDocument>) -> MihomoEndpoint {
         let controller = document
             .and_then(|document| document.typed.global.external_controller.as_deref())
-            .unwrap_or("127.0.0.1:9090");
+            .unwrap_or("127.0.0.1:19090");
         MihomoEndpoint {
             base_url: normalize_controller_url(controller),
             secret: document
@@ -810,7 +853,7 @@ mod tests {
         let running_options = services.detection_options().unwrap();
         assert_eq!(
             running_options.controller_addr.as_deref(),
-            Some("http://127.0.0.1:9090")
+            Some("http://127.0.0.1:19090")
         );
     }
 
@@ -958,6 +1001,30 @@ function override(subscriptionName, config) {
         assert_eq!(path, paths.config_dir.join("core.runtime.config.yaml"));
         assert!(runtime_config.contains("mixed-port: 19191"));
         assert!(runtime_config.contains("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn current_mixed_port_uses_effective_runtime_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths).unwrap();
+        services
+            .save_override_script(
+                r#"
+function override(subscriptionName, config) {
+  config["mixed-port"] = 19191;
+  return config;
+}
+"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(services.current_mixed_port().unwrap(), Some(19191));
     }
 
     #[test]
