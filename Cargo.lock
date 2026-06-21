@@ -156,6 +156,7 @@ dependencies = [
  "air-config",
  "air-error",
  "air-mihomo",
+ "air-platform",
  "air-settings",
  "async-trait",
  "directories",
