@@ -11,7 +11,6 @@ members = [
     "crates/air-telemetry",
     "crates/air-error",
 ]
-exclude = ["third_party/zed-gpui-macos"]
 resolver = "3"
 
 [workspace.package]
@@ -62,6 +61,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Services", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
-
-[patch."https://github.com/zed-industries/zed"]
-gpui_macos = { path = "third_party/zed-gpui-macos/crates/gpui_macos" }

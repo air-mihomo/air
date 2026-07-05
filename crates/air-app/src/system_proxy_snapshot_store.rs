@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 
 use air_error::{AppResult, StorageError};
 use air_platform::system_proxy::SystemProxySnapshot;
-
-use super::{AppPaths, FileStore, StoredFormat};
+use air_storage::{AppPaths, FileStore, StoredFormat};
 
 pub const SYSTEM_PROXY_SNAPSHOT_PATH: &str = "system-proxy-snapshot.json";
 

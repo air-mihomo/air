@@ -70,6 +70,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -155,8 +156,6 @@ version = "0.1.0"
 dependencies = [
  "air-config",
  "air-error",
- "air-mihomo",
- "air-platform",
  "air-settings",
  "async-trait",
  "directories",
@@ -2426,6 +2425,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed#ee5c7b6d45faeccd40a285be63a853753c91eff0"
 dependencies = [
  "anyhow",
  "async-task",

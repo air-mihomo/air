@@ -724,6 +724,9 @@ impl Shell {
         if field == settings::SettingsBoolField::Autostart {
             sync_platform_autostart(value);
         }
+        if field == settings::SettingsBoolField::SystemProxy {
+            self.sync_system_proxy_setting();
+        }
     }
 
     pub(crate) fn set_settings_text(
@@ -832,6 +835,16 @@ impl Shell {
         };
         if let Err(error) = router.services().save_settings(self.settings.settings()) {
             tracing::warn!(%error, "failed to persist gui settings");
+        }
+    }
+
+    fn sync_system_proxy_setting(&self) {
+        let Some(router) = &self.command_router else {
+            tracing::warn!("app services unavailable, skip synchronizing system proxy setting");
+            return;
+        };
+        if let Err(error) = router.services().sync_system_proxy_to_current_config() {
+            tracing::warn!(%error, "failed to synchronize system proxy setting");
         }
     }
 }

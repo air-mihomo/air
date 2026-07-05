@@ -5,44 +5,23 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use reqwest::header::{
     CONTENT_DISPOSITION, ETAG, HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE,
     IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT,
 };
 use reqwest::{Client, Proxy};
-use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-use air_config::model::{MihomoConfigDocument, ProxyNode};
-use air_telemetry::redaction::redact_log_value;
-
-use super::{
-    SubscriptionCacheMetadata, SubscriptionSource, SubscriptionTimestamp,
+use air_config::model::MihomoConfigDocument;
+use air_config::subscriptions::{
+    ParsedSubscription, SubscriptionCacheMetadata, SubscriptionContentFormat,
+    SubscriptionDiagnostic, SubscriptionDiagnosticSeverity, SubscriptionPipelineError,
+    SubscriptionSource, SubscriptionTimestamp, SubscriptionUpdateCacheStore,
     SubscriptionUpdateOutcome, SubscriptionUpdateResult, SubscriptionUserInfo,
 };
+use air_telemetry::redaction::redact_log_value;
 
 const SUBSCRIPTION_USERINFO: &str = "subscription-userinfo";
-
-#[async_trait]
-pub trait SubscriptionUpdateCacheStore: Send + Sync {
-    async fn load_metadata(
-        &self,
-        subscription_id: &str,
-    ) -> Result<Option<SubscriptionCacheMetadata>, SubscriptionPipelineError>;
-
-    async fn read_cached_content(
-        &self,
-        subscription_id: &str,
-    ) -> Result<Option<Vec<u8>>, SubscriptionPipelineError>;
-
-    async fn record_update(
-        &self,
-        subscription_id: &str,
-        result: SubscriptionUpdateResult,
-        content: Option<&[u8]>,
-    ) -> Result<SubscriptionCacheMetadata, SubscriptionPipelineError>;
-}
 
 #[derive(Clone, Debug)]
 pub struct SubscriptionUpdatePipeline<S> {
@@ -317,65 +296,6 @@ pub struct SubscriptionPipelineReport {
     pub parsed: ParsedSubscription,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ParsedSubscription {
-    pub format: SubscriptionContentFormat,
-    pub document: MihomoConfigDocument,
-    pub proxies: Vec<ProxyNode>,
-    pub diagnostics: Vec<SubscriptionDiagnostic>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SubscriptionContentFormat {
-    MihomoYaml,
-    Base64Nodes,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SubscriptionDiagnosticSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct SubscriptionDiagnostic {
-    pub severity: SubscriptionDiagnosticSeverity,
-    pub code: String,
-    pub message: String,
-}
-
-impl SubscriptionDiagnostic {
-    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            severity: SubscriptionDiagnosticSeverity::Error,
-            code: code.into(),
-            message: redact_log_value(&message.into()),
-        }
-    }
-
-    pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            severity: SubscriptionDiagnosticSeverity::Warning,
-            code: code.into(),
-            message: redact_log_value(&message.into()),
-        }
-    }
-}
-
-impl Default for SubscriptionDiagnostic {
-    fn default() -> Self {
-        Self {
-            severity: SubscriptionDiagnosticSeverity::Info,
-            code: String::new(),
-            message: String::new(),
-        }
-    }
-}
-
 fn log_subscription_diagnostics(
     scope: &str,
     proxy_count: usize,
@@ -394,7 +314,7 @@ fn log_subscription_diagnostics(
         .filter(|diagnostic| diagnostic.severity == SubscriptionDiagnosticSeverity::Info)
         .count();
 
-    // 订阅内容校验不记录正文和 URL，只记录脱敏后的诊断明细，避免订阅 token 泄漏到日志。
+    // Subscription validation never logs the source URL or content body.
     if errors > 0 {
         tracing::warn!(
             target: "air::validation",
@@ -522,58 +442,6 @@ impl ReservedBase64NodeParser {
         )];
         log_subscription_diagnostics("subscription-base64-parser", 0, &diagnostics);
         Err(SubscriptionPipelineError::Parse { diagnostics })
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum SubscriptionPipelineError {
-    #[error("订阅源已禁用: {0}")]
-    Disabled(String),
-    #[error("订阅请求无效: {0}")]
-    InvalidRequest(String),
-    #[error("订阅下载失败: {0}")]
-    Network(String),
-    #[error("订阅响应状态异常: {status}")]
-    HttpStatus {
-        status: u16,
-        diagnostics: Vec<SubscriptionDiagnostic>,
-    },
-    #[error("订阅响应无效")]
-    InvalidResponse(Vec<SubscriptionDiagnostic>),
-    #[error("订阅解析失败")]
-    Parse {
-        diagnostics: Vec<SubscriptionDiagnostic>,
-    },
-    #[error("订阅缓存失败: {0}")]
-    Cache(String),
-}
-
-impl SubscriptionPipelineError {
-    pub fn diagnostics(&self) -> Vec<SubscriptionDiagnostic> {
-        match self {
-            Self::Disabled(source_id) => vec![SubscriptionDiagnostic::error(
-                "subscription-disabled",
-                format!("订阅源已禁用: {source_id}"),
-            )],
-            Self::InvalidRequest(message) => {
-                vec![SubscriptionDiagnostic::error(
-                    "invalid-request",
-                    message.clone(),
-                )]
-            }
-            Self::Network(message) => vec![SubscriptionDiagnostic::error(
-                "network",
-                format!("订阅下载失败: {message}"),
-            )],
-            Self::HttpStatus { diagnostics, .. }
-            | Self::InvalidResponse(diagnostics)
-            | Self::Parse { diagnostics } => diagnostics.clone(),
-            Self::Cache(message) => vec![SubscriptionDiagnostic::error("cache", message.clone())],
-        }
-    }
-
-    fn safe_message(&self) -> String {
-        redact_log_value(&format!("{self:?} {self}"))
     }
 }
 
@@ -780,6 +648,7 @@ mod tests {
 
     use super::*;
     use air_mihomo::subscriptions::{SubscriptionRequestHeaders, SubscriptionUrl};
+    use async_trait::async_trait;
 
     #[derive(Clone, Default)]
     struct MemoryUpdateStore {

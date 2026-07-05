@@ -1,8 +1,10 @@
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use air_error::{AppResult, PlatformError};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_os = "macos", test))]
 const LOCAL_PROXY_HOST: &str = "127.0.0.1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,19 +171,16 @@ fn platform_restore_system_proxy_snapshot(
             skipped_services.push(saved.service.clone());
             continue;
         };
-        if !service_snapshot_matches_local_proxy(current_service, snapshot.managed_port) {
-            skipped_services.push(saved.service.clone());
+        let args = macos_restore_args_for_air_owned_proxy_kinds(
+            &saved.service,
+            saved,
+            current_service,
+            snapshot.managed_port,
+        )?;
+        if args.is_empty() {
             continue;
         }
-        for args in macos_restore_proxy_args(MacosProxyKind::Web, &saved.service, &saved.web)? {
-            run_networksetup_owned(args)?;
-        }
-        for args in
-            macos_restore_proxy_args(MacosProxyKind::SecureWeb, &saved.service, &saved.secure_web)?
-        {
-            run_networksetup_owned(args)?;
-        }
-        for args in macos_restore_proxy_args(MacosProxyKind::Socks, &saved.service, &saved.socks)? {
+        for args in args {
             run_networksetup_owned(args)?;
         }
         restored_services.push(saved.service.clone());
@@ -393,55 +392,58 @@ fn macos_restore_proxy_args(
     service: &str,
     state: &MacosProxyState,
 ) -> AppResult<Vec<Vec<String>>> {
-    let server = state.server.clone().unwrap_or_default();
-    let port = state.port.unwrap_or(0);
-    validate_port_for_restore(port)?;
-
-    Ok(vec![
-        vec![
-            kind.set_command().into(),
-            service.into(),
-            server,
-            port.to_string(),
-            "off".into(),
-        ],
-        vec![
-            kind.state_command().into(),
-            service.into(),
-            if state.enabled { "on" } else { "off" }.into(),
-        ],
-    ])
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn validate_port_for_restore(port: u32) -> AppResult<()> {
-    if port <= u16::MAX as u32 {
-        Ok(())
-    } else {
-        Err(PlatformError::OperationFailed(format!("系统代理端口无效: {port}")).into())
+    let mut args = Vec::new();
+    match (state.server.as_deref(), state.port) {
+        (Some(server), Some(port)) => {
+            validate_port(port)?;
+            args.push(vec![
+                kind.set_command().into(),
+                service.into(),
+                server.into(),
+                port.to_string(),
+                "off".into(),
+            ]);
+        }
+        (None, None) if !state.enabled => {}
+        _ if state.enabled => {
+            return Err(PlatformError::OperationFailed(format!(
+                "无法恢复已启用的系统代理，服务 {service} 缺少服务器或端口"
+            ))
+            .into());
+        }
+        _ => {}
     }
+
+    args.push(vec![
+        kind.state_command().into(),
+        service.into(),
+        if state.enabled { "on" } else { "off" }.into(),
+    ]);
+    Ok(args)
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn service_snapshot_matches_local_proxy(service: &SystemProxyServiceSnapshot, port: u32) -> bool {
-    service.web.matches_local_proxy(port)
-        && service.secure_web.matches_local_proxy(port)
-        && service.socks.matches_local_proxy(port)
-}
-
-#[cfg(test)]
-fn snapshot_services_match_local_proxy(
-    snapshot: &SystemProxySnapshot,
-    services: &[String],
+fn macos_restore_args_for_air_owned_proxy_kinds(
+    service: &str,
+    saved: &SystemProxyServiceSnapshot,
+    current: &SystemProxyServiceSnapshot,
     port: u32,
-) -> bool {
-    services.iter().all(|service| {
-        snapshot
-            .services
-            .iter()
-            .find(|snapshot| &snapshot.service == service)
-            .is_some_and(|snapshot| service_snapshot_matches_local_proxy(snapshot, port))
-    })
+) -> AppResult<Vec<Vec<String>>> {
+    let mut args = Vec::new();
+    for (kind, saved_state, current_state) in [
+        (MacosProxyKind::Web, &saved.web, &current.web),
+        (
+            MacosProxyKind::SecureWeb,
+            &saved.secure_web,
+            &current.secure_web,
+        ),
+        (MacosProxyKind::Socks, &saved.socks, &current.socks),
+    ] {
+        if current_state.matches_local_proxy(port) {
+            args.extend(macos_restore_proxy_args(kind, service, saved_state)?);
+        }
+    }
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -569,27 +571,97 @@ mod tests {
     }
 
     #[test]
-    fn macos_snapshot_matches_only_when_all_proxies_are_air_owned() {
-        let current = SystemProxySnapshot {
-            managed_port: 9870,
-            services: vec![SystemProxyServiceSnapshot {
-                service: "Wi-Fi".into(),
-                web: MacosProxyState::local_enabled(9870),
-                secure_web: MacosProxyState::local_enabled(9870),
-                socks: MacosProxyState::local_enabled(9870),
-            }],
+    fn macos_restore_args_for_disabled_proxy_without_server_only_disable_state() {
+        let state = MacosProxyState {
+            enabled: false,
+            server: None,
+            port: None,
+            authenticated: false,
         };
 
-        assert!(snapshot_services_match_local_proxy(
-            &current,
-            &["Wi-Fi".to_string()],
-            9870
-        ));
-        assert!(!snapshot_services_match_local_proxy(
-            &current,
-            &["Wi-Fi".to_string()],
-            19090
-        ));
+        let args = macos_restore_proxy_args(MacosProxyKind::Web, "Wi-Fi", &state).unwrap();
+
+        assert_eq!(
+            args,
+            vec![vec![
+                "-setwebproxystate".to_string(),
+                "Wi-Fi".to_string(),
+                "off".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn macos_restore_args_reject_enabled_proxy_without_server_or_port() {
+        let state = MacosProxyState {
+            enabled: true,
+            server: None,
+            port: Some(8080),
+            authenticated: false,
+        };
+
+        assert!(macos_restore_proxy_args(MacosProxyKind::Web, "Wi-Fi", &state).is_err());
+
+        let state = MacosProxyState {
+            enabled: true,
+            server: Some("proxy.example.test".into()),
+            port: None,
+            authenticated: false,
+        };
+
+        assert!(macos_restore_proxy_args(MacosProxyKind::Web, "Wi-Fi", &state).is_err());
+    }
+
+    #[test]
+    fn macos_restore_args_only_include_air_owned_proxy_kinds() {
+        let saved = SystemProxyServiceSnapshot {
+            service: "Wi-Fi".into(),
+            web: MacosProxyState {
+                enabled: false,
+                server: Some("proxy.example.test".into()),
+                port: Some(8080),
+                authenticated: false,
+            },
+            secure_web: MacosProxyState::default(),
+            socks: MacosProxyState::default(),
+        };
+        let current = SystemProxyServiceSnapshot {
+            service: "Wi-Fi".into(),
+            web: MacosProxyState::local_enabled(9870),
+            secure_web: MacosProxyState {
+                enabled: true,
+                server: Some("other.example.test".into()),
+                port: Some(8081),
+                authenticated: false,
+            },
+            socks: MacosProxyState::local_enabled(9870),
+        };
+
+        let args =
+            macos_restore_args_for_air_owned_proxy_kinds("Wi-Fi", &saved, &current, 9870).unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                vec![
+                    "-setwebproxy".to_string(),
+                    "Wi-Fi".to_string(),
+                    "proxy.example.test".to_string(),
+                    "8080".to_string(),
+                    "off".to_string(),
+                ],
+                vec![
+                    "-setwebproxystate".to_string(),
+                    "Wi-Fi".to_string(),
+                    "off".to_string(),
+                ],
+                vec![
+                    "-setsocksfirewallproxystate".to_string(),
+                    "Wi-Fi".to_string(),
+                    "off".to_string(),
+                ],
+            ]
+        );
     }
 
     #[test]
