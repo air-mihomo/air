@@ -15,6 +15,8 @@ use tokio::sync::{Mutex, broadcast};
 use air_error::{AppResult, ProcessError};
 use air_mihomo::{CoreBinary, CoreLaunchOptions, CoreProcessStatus, CoreRuntime};
 use air_platform::core_service;
+#[cfg(target_os = "macos")]
+use air_platform::elevated_process::terminate_macos_process_with_admin;
 use air_platform::elevated_process::{ElevatedChild, ElevatedProcessConfig};
 use air_platform::privilege;
 use air_telemetry::log_retention::{format_current_log_timestamp, prepare_managed_log_for_append};
@@ -184,15 +186,25 @@ impl MihomoProcessManager {
             elevated = should_elevate,
             "spawning mihomo process"
         );
-        inner.status = CoreProcessStatus::Starting;
         if should_elevate {
             if core_service::query_core_service()?.installed {
+                inner.status = CoreProcessStatus::Starting;
                 tracing::info!("starting mihomo through installed core service");
                 core_service::start_core_service()?;
                 inner.child = Some(ManagedChild::Service);
                 inner.status = CoreProcessStatus::Running { pid: 0 };
                 return Ok(inner.status.clone());
             }
+            if let Some(child) =
+                adopt_existing_elevated_mihomo_process(&preview, config.console_log_path.as_deref())
+            {
+                let pid = child.id();
+                inner.child = Some(ManagedChild::Elevated(child));
+                inner.status = CoreProcessStatus::Running { pid };
+                return Ok(inner.status.clone());
+            }
+            cleanup_stale_elevated_mihomo_processes(&preview, config.console_log_path.as_deref())?;
+            inner.status = CoreProcessStatus::Starting;
             let child = match spawn_elevated_child(&preview, config.console_log_path.clone()) {
                 Ok(child) => child,
                 Err(error) => {
@@ -209,8 +221,7 @@ impl MihomoProcessManager {
             };
             let pid = child.id();
             tracing::info!(pid, "elevated mihomo process spawned");
-            let message =
-                "mihomo 已通过 UAC 以管理员权限启动，stdout/stderr 将由提权 helper 写入 core.log";
+            let message = "mihomo 已通过管理员权限启动，stdout/stderr 将写入 core.log";
             append_console_log_line_if_configured(config.console_log_path.as_deref(), message);
             let _ = self.events.send(ProcessEvent::Log {
                 stream: ProcessLogStream::Stdout,
@@ -220,6 +231,7 @@ impl MihomoProcessManager {
             inner.status = CoreProcessStatus::Running { pid };
             return Ok(inner.status.clone());
         }
+        inner.status = CoreProcessStatus::Starting;
         let mut command = Command::new(&preview.program);
         command
             .args(&preview.args)
@@ -380,6 +392,379 @@ fn spawn_elevated_child(
         current_dir: preview.current_dir.clone(),
         console_log_path,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn adopt_existing_elevated_mihomo_process(
+    preview: &CommandPreview,
+    console_log_path: Option<&Path>,
+) -> Option<ElevatedChild> {
+    let pid = macos_select_adoptable_core_pid(
+        preview,
+        std::process::id(),
+        list_macos_process_ids(),
+        |pid| macos_core_process_matches_preview(pid, preview),
+    )?;
+    tracing::info!(
+        pid,
+        program = %preview.program.display(),
+        args = ?preview.args,
+        "adopting already running elevated mihomo process"
+    );
+    append_console_log_line_if_configured(
+        console_log_path,
+        &format!("Air 检测到已运行的 mihomo 进程 {pid}，已接管而不是重复启动"),
+    );
+    Some(ElevatedChild::adopt_macos_pid(pid))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn adopt_existing_elevated_mihomo_process(
+    _preview: &CommandPreview,
+    _console_log_path: Option<&Path>,
+) -> Option<ElevatedChild> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MacosAirMihomoPidFile {
+    pid_file: PathBuf,
+    owner_pid: u32,
+    core_pid: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosCoreProcessMatch {
+    Matches,
+    DoesNotMatch,
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_stale_elevated_mihomo_processes(
+    preview: &CommandPreview,
+    console_log_path: Option<&Path>,
+) -> AppResult<()> {
+    let current_pid = std::process::id();
+    for candidate in discover_macos_air_mihomo_pid_files() {
+        if !macos_pid_is_running(candidate.core_pid) {
+            let _ = std::fs::remove_file(&candidate.pid_file);
+            continue;
+        }
+        let should_cleanup = macos_stale_pid_file_should_cleanup(
+            &candidate,
+            preview,
+            current_pid,
+            macos_pid_is_running,
+            |pid| !macos_pid_is_running(pid),
+            |pid| macos_core_process_matches_preview(pid, preview),
+        );
+        if !should_cleanup {
+            continue;
+        }
+
+        tracing::warn!(
+            owner_pid = candidate.owner_pid,
+            core_pid = candidate.core_pid,
+            pid_file = %candidate.pid_file.display(),
+            "terminating stale elevated mihomo process before starting a new one"
+        );
+        append_console_log_line_if_configured(
+            console_log_path,
+            &format!(
+                "Air 检测到旧的提权 mihomo 进程 {}，正在启动前清理",
+                candidate.core_pid
+            ),
+        );
+        terminate_macos_process_with_admin(candidate.core_pid, Duration::from_secs(2))?;
+        let _ = std::fs::remove_file(&candidate.pid_file);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_stale_elevated_mihomo_processes(
+    _preview: &CommandPreview,
+    _console_log_path: Option<&Path>,
+) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn discover_macos_air_mihomo_pid_files() -> Vec<MacosAirMihomoPidFile> {
+    let mut candidates = Vec::new();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return candidates;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(candidate) = parse_macos_air_mihomo_pid_file(&path, &source) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_air_mihomo_pid_file(path: &Path, source: &str) -> Option<MacosAirMihomoPidFile> {
+    let file_name = path.file_name()?.to_str()?;
+    let owner_pid = file_name
+        .strip_prefix("air-mihomo-")?
+        .strip_suffix(".pid")?
+        .parse::<u32>()
+        .ok()?;
+    let core_pid = source.trim().parse::<u32>().ok()?;
+    Some(MacosAirMihomoPidFile {
+        pid_file: path.to_path_buf(),
+        owner_pid,
+        core_pid,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_stale_pid_file_should_cleanup(
+    candidate: &MacosAirMihomoPidFile,
+    _preview: &CommandPreview,
+    current_pid: u32,
+    core_is_running: impl Fn(u32) -> bool,
+    owner_is_dead: impl Fn(u32) -> bool,
+    core_matches: impl Fn(u32) -> MacosCoreProcessMatch,
+) -> bool {
+    if candidate.owner_pid == current_pid {
+        return false;
+    }
+    if !core_is_running(candidate.core_pid) {
+        return false;
+    }
+    if !owner_is_dead(candidate.owner_pid) {
+        return false;
+    }
+    matches!(
+        core_matches(candidate.core_pid),
+        MacosCoreProcessMatch::Matches
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_select_adoptable_core_pid(
+    _preview: &CommandPreview,
+    current_pid: u32,
+    pids: impl IntoIterator<Item = u32>,
+    core_matches: impl Fn(u32) -> MacosCoreProcessMatch,
+) -> Option<u32> {
+    pids.into_iter()
+        .filter(|pid| *pid != current_pid)
+        .find(|pid| matches!(core_matches(*pid), MacosCoreProcessMatch::Matches))
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_process_ids() -> Vec<u32> {
+    match std::fs::read_dir("/proc") {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .collect(),
+        Err(_) => list_macos_process_ids_with_ps(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_process_ids_with_ps() -> Vec<u32> {
+    std::process::Command::new("ps")
+        .args(["-axo", "pid="])
+        .output()
+        .ok()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pid_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_core_process_matches_preview(pid: u32, preview: &CommandPreview) -> MacosCoreProcessMatch {
+    match read_macos_process_argv(pid) {
+        Ok(Some(argv)) => {
+            if macos_process_argv_matches_preview(&argv, preview) {
+                MacosCoreProcessMatch::Matches
+            } else {
+                MacosCoreProcessMatch::DoesNotMatch
+            }
+        }
+        Ok(None) => MacosCoreProcessMatch::Unknown,
+        Err(error) => {
+            tracing::debug!(
+                pid,
+                error = %error,
+                "failed to read macOS process argv through sysctl; trying ps fallback"
+            );
+            match read_macos_process_command_with_ps(pid) {
+                Ok(Some(command)) => {
+                    if macos_process_command_matches_preview(&command, preview) {
+                        MacosCoreProcessMatch::Matches
+                    } else {
+                        MacosCoreProcessMatch::DoesNotMatch
+                    }
+                }
+                Ok(None) | Err(_) => MacosCoreProcessMatch::Unknown,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_argv_matches_preview(argv: &[String], preview: &CommandPreview) -> bool {
+    argv.first()
+        .map(|program| Path::new(program) == preview.program)
+        .unwrap_or(false)
+        && argv
+            .get(1..)
+            .map(|args| args == preview.args)
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_process_command_with_ps(pid: u32) -> std::io::Result<Option<String>> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!command.is_empty()).then_some(command))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_command_matches_preview(command: &str, preview: &CommandPreview) -> bool {
+    command.trim() == macos_preview_command_line(preview)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_preview_command_line(preview: &CommandPreview) -> String {
+    std::iter::once(preview.program.to_string_lossy().to_string())
+        .chain(preview.args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_process_argv(pid: u32) -> std::io::Result<Option<Vec<String>>> {
+    const CTL_KERN: i32 = 1;
+    const KERN_PROCARGS2: i32 = 49;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        fn sysctl(
+            name: *mut i32,
+            namelen: u32,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid out of range"))?;
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid];
+    let mut size = 0usize;
+    let result = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    if size == 0 {
+        return Ok(None);
+    }
+
+    let mut buffer = vec![0u8; size];
+    let result = unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ESRCH) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    buffer.truncate(size);
+    Ok(parse_macos_procargs(&buffer))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_procargs(buffer: &[u8]) -> Option<Vec<String>> {
+    let argc_bytes: [u8; 4] = buffer.get(..4)?.try_into().ok()?;
+    let argc = i32::from_ne_bytes(argc_bytes);
+    if argc <= 0 {
+        return None;
+    }
+    let mut offset = 4;
+    while offset < buffer.len() && buffer[offset] != 0 {
+        offset += 1;
+    }
+    while offset < buffer.len() && buffer[offset] == 0 {
+        offset += 1;
+    }
+
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        if offset >= buffer.len() {
+            break;
+        }
+        let start = offset;
+        while offset < buffer.len() && buffer[offset] != 0 {
+            offset += 1;
+        }
+        if offset > start {
+            argv.push(String::from_utf8_lossy(&buffer[start..offset]).to_string());
+        }
+        while offset < buffer.len() && buffer[offset] == 0 {
+            offset += 1;
+        }
+    }
+    if argv.is_empty() { None } else { Some(argv) }
 }
 
 #[cfg(windows)]
@@ -901,5 +1286,182 @@ mod tests {
         {
             PathBuf::from("/bin/sh")
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pid_file_parser_accepts_air_mihomo_pid_files_only() {
+        let candidate =
+            parse_macos_air_mihomo_pid_file(Path::new("/tmp/air-mihomo-123.pid"), "456\n")
+                .expect("valid Air mihomo pid file should parse");
+
+        assert_eq!(candidate.owner_pid, 123);
+        assert_eq!(candidate.core_pid, 456);
+        assert_eq!(candidate.pid_file, PathBuf::from("/tmp/air-mihomo-123.pid"));
+        assert!(parse_macos_air_mihomo_pid_file(Path::new("/tmp/other.pid"), "456").is_none());
+        assert!(
+            parse_macos_air_mihomo_pid_file(Path::new("/tmp/air-mihomo-abc.pid"), "456").is_none()
+        );
+        assert!(
+            parse_macos_air_mihomo_pid_file(Path::new("/tmp/air-mihomo-123.pid"), "abc").is_none()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_pid_file_requires_dead_owner_and_matching_core_command() {
+        let preview = CommandPreview {
+            program: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core/mihomo"),
+            args: vec![
+                "-d".into(),
+                "/Users/example/Library/Caches/org.air.Air/core".into(),
+                "-f".into(),
+                "/Users/example/Library/Application Support/org.air.Air/core.runtime.config.yaml"
+                    .into(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core"),
+            requires_admin: true,
+        };
+        let candidate = MacosAirMihomoPidFile {
+            pid_file: PathBuf::from("/tmp/air-mihomo-100.pid"),
+            owner_pid: 100,
+            core_pid: 200,
+        };
+        let matching_argv = vec![
+            preview.program.to_string_lossy().to_string(),
+            "-d".into(),
+            "/Users/example/Library/Caches/org.air.Air/core".into(),
+            "-f".into(),
+            "/Users/example/Library/Application Support/org.air.Air/core.runtime.config.yaml"
+                .into(),
+        ];
+
+        assert!(macos_stale_pid_file_should_cleanup(
+            &candidate,
+            &preview,
+            999,
+            |pid| pid == 200,
+            |pid| pid == 100,
+            |pid| {
+                assert_eq!(pid, 200);
+                MacosCoreProcessMatch::Matches
+            },
+        ));
+        assert!(!macos_stale_pid_file_should_cleanup(
+            &candidate,
+            &preview,
+            999,
+            |pid| pid == 200,
+            |pid| pid == 100,
+            |_| MacosCoreProcessMatch::DoesNotMatch,
+        ));
+        assert!(!macos_stale_pid_file_should_cleanup(
+            &candidate,
+            &preview,
+            999,
+            |pid| pid == 200,
+            |pid| pid == 100,
+            |_| MacosCoreProcessMatch::Unknown,
+        ));
+        assert!(!macos_stale_pid_file_should_cleanup(
+            &candidate,
+            &preview,
+            999,
+            |pid| pid == 200,
+            |_| false,
+            |_| MacosCoreProcessMatch::Matches,
+        ));
+        assert!(!macos_stale_pid_file_should_cleanup(
+            &candidate,
+            &preview,
+            100,
+            |pid| pid == 200,
+            |pid| pid == 100,
+            |_| MacosCoreProcessMatch::Matches,
+        ));
+
+        assert!(macos_process_argv_matches_preview(&matching_argv, &preview));
+        let mut wrong_args = matching_argv;
+        wrong_args[4] = "/tmp/other.yaml".into();
+        assert!(!macos_process_argv_matches_preview(&wrong_args, &preview));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_existing_process_adoption_selects_matching_non_current_pid() {
+        let preview = CommandPreview {
+            program: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core/mihomo"),
+            args: vec![
+                "-d".into(),
+                "/Users/example/Library/Caches/org.air.Air/core".into(),
+                "-f".into(),
+                "/Users/example/Library/Application Support/org.air.Air/core.runtime.config.yaml"
+                    .into(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core"),
+            requires_admin: true,
+        };
+
+        let selected =
+            macos_select_adoptable_core_pid(&preview, 100, [100, 200, 300], |pid| match pid {
+                200 => MacosCoreProcessMatch::DoesNotMatch,
+                300 => MacosCoreProcessMatch::Matches,
+                _ => MacosCoreProcessMatch::Unknown,
+            });
+
+        assert_eq!(selected, Some(300));
+        assert_eq!(
+            macos_select_adoptable_core_pid(&preview, 100, [100, 200], |_| {
+                MacosCoreProcessMatch::Unknown
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ps_command_fallback_matches_exact_preview_command() {
+        let preview = CommandPreview {
+            program: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core/mihomo"),
+            args: vec![
+                "-d".into(),
+                "/Users/example/Library/Caches/org.air.Air/core".into(),
+                "-f".into(),
+                "/Users/example/Library/Application Support/org.air.Air/core.runtime.config.yaml"
+                    .into(),
+            ],
+            env: BTreeMap::new(),
+            current_dir: PathBuf::from("/Users/example/Library/Caches/org.air.Air/core"),
+            requires_admin: true,
+        };
+        let command = "/Users/example/Library/Caches/org.air.Air/core/mihomo -d /Users/example/Library/Caches/org.air.Air/core -f /Users/example/Library/Application Support/org.air.Air/core.runtime.config.yaml";
+
+        assert!(macos_process_command_matches_preview(command, &preview));
+        assert!(!macos_process_command_matches_preview(
+            "/Users/example/Library/Caches/org.air.Air/core/mihomo -d /tmp/other -f /tmp/other.yaml",
+            &preview
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_procargs_parser_extracts_argv_after_exec_path_padding() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&(3i32).to_ne_bytes());
+        buffer.extend_from_slice(b"/usr/local/bin/mihomo\0\0\0");
+        buffer.extend_from_slice(b"/usr/local/bin/mihomo\0-d\0/tmp/Air Data\0USER=ignored\0");
+
+        let argv = parse_macos_procargs(&buffer).expect("procargs should parse");
+
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/local/bin/mihomo".to_string(),
+                "-d".to_string(),
+                "/tmp/Air Data".to_string(),
+            ]
+        );
     }
 }

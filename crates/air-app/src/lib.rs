@@ -7,6 +7,7 @@ pub mod runtime;
 pub mod services;
 pub mod state;
 pub mod subscription_controller;
+pub mod system_proxy_snapshot_store;
 
 use air_error::AppResult;
 

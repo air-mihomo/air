@@ -3,11 +3,11 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use air_error::{AppResult, ConfigError, StorageError};
-use air_mihomo::subscriptions::{
+use air_config::subscriptions::{
     SubscriptionCacheMetadata, SubscriptionIndex, SubscriptionPipelineError, SubscriptionSource,
     SubscriptionTimestamp, SubscriptionUpdateCacheStore, SubscriptionUpdateResult,
 };
+use air_error::{AppResult, ConfigError, StorageError};
 use async_trait::async_trait;
 
 use super::{AppPaths, FileStore, StoredFormat};
@@ -470,7 +470,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use air_mihomo::subscriptions::{
+    use air_config::subscriptions::{
         SubscriptionRequestHeaders, SubscriptionSourceKind, SubscriptionUpdateOutcome,
         SubscriptionUrl,
     };

@@ -14,11 +14,18 @@ use super::{AppPaths, FileStore};
 pub const CORE_COMMON_CONFIG_PATH: &str = "core.common.config.yaml";
 pub const CORE_RUNTIME_CONFIG_PATH: &str = "core.runtime.config.yaml";
 
-const DEFAULT_CORE_CONFIG: &str = r#"mixed-port: 9870
-external-controller: 127.0.0.1:9090
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_TUN_DEVICE: &str = "air";
+
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_TUN_AUTO_ROUTE: &str = "false";
+
+const DEFAULT_CORE_CONFIG_PREFIX: &str = r#"mixed-port: 9870
+ipv6: false
+external-controller: 127.0.0.1:19090
 dns:
   enable: true
-  ipv6: true
+  ipv6: false
   listen: 0.0.0.0:1053
   enhanced-mode: redir-host
   fake-ip-range: 198.18.0.1/16
@@ -38,8 +45,10 @@ dns:
   use-system-hosts: true
 tun:
   enable: true
-  device: air
-  stack: mixed
+"#;
+
+const DEFAULT_CORE_CONFIG_SUFFIX: &str = r#"  stack: mixed
+  auto-redirect: false
   dns-hijack:
     - any:53
   mtu: 1500
@@ -100,7 +109,7 @@ impl CoreConfigStore {
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 tracing::info!(path = %target.display(), "user core config missing; using built-in defaults");
-                Ok(ConfigDocument::parse(DEFAULT_CORE_CONFIG)?)
+                Ok(ConfigDocument::parse(default_core_config_source())?)
             }
             Err(error) => Err(StorageError::Io(error).into()),
         }
@@ -203,6 +212,21 @@ impl CoreConfigStore {
     }
 }
 
+fn default_core_config_source() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "{DEFAULT_CORE_CONFIG_PREFIX}  auto-route: true\n  inet4-address:\n    - 172.19.0.1/30\n{DEFAULT_CORE_CONFIG_SUFFIX}"
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!(
+            "{DEFAULT_CORE_CONFIG_PREFIX}  device: {DEFAULT_TUN_DEVICE}\n  auto-route: {DEFAULT_TUN_AUTO_ROUTE}\n{DEFAULT_CORE_CONFIG_SUFFIX}"
+        )
+    }
+}
+
 fn apply_subscription_sections(target: &mut MihomoConfigDocument, incoming: &MihomoConfigDocument) {
     for proxy in &incoming.proxies {
         replace_by_name(&mut target.proxies, proxy.clone(), |item| {
@@ -248,6 +272,7 @@ fn prune_nulls(value: &mut Value) {
                         prune_nulls(child);
                         prune_blank_geox_url_fields(&key, child);
                         is_empty_geox_url(&key, child)
+                            || is_runtime_sensitive_empty_field(&key, child)
                     }
                     None => false,
                 };
@@ -268,6 +293,14 @@ fn prune_nulls(value: &mut Value) {
 fn is_empty_geox_url(key: &Value, child: &Value) -> bool {
     matches!(key, Value::String(key) if key == "geox-url")
         && matches!(child, Value::Mapping(map) if map.is_empty())
+}
+
+fn is_runtime_sensitive_empty_field(key: &Value, child: &Value) -> bool {
+    let Value::String(key) = key else {
+        return false;
+    };
+    matches!(key.as_str(), "lan-allowed-ips")
+        && matches!(child, Value::Sequence(items) if items.is_empty())
 }
 
 fn prune_blank_geox_url_fields(key: &Value, child: &mut Value) {
@@ -315,6 +348,58 @@ mod tests {
         assert!(source.contains("listen: 0.0.0.0:1053"));
         assert!(source.contains("geo-update-interval: 24"));
         assert!(!source.contains("null"));
+        assert!(
+            !source.contains("lan-allowed-ips: []"),
+            "mihomo v1.19.27 treats an empty lan-allowed-ips list as rejecting local mixed-port clients"
+        );
+    }
+
+    #[test]
+    fn preserves_non_empty_lan_allowed_ips_when_saving_core_config() {
+        let (temp, store) = store_in_temp();
+        let mut document = store.load_user_config().unwrap();
+        document.typed.global.lan_allowed_ips = vec!["127.0.0.1/32".to_string()];
+
+        store.save_user_config(&document).unwrap();
+
+        let source =
+            fs::read_to_string(temp.path().join("config/core.common.config.yaml")).unwrap();
+        assert!(source.contains("lan-allowed-ips:"));
+        assert!(source.contains("- 127.0.0.1/32"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_core_config_uses_macos_safe_tun_defaults() {
+        let (_temp, store) = store_in_temp();
+        let document = store.load_user_config().unwrap();
+        let tun = document
+            .typed
+            .tun
+            .expect("默认配置需要包含 TUN 配置，方便首次启动核心");
+
+        assert_eq!(
+            tun.device.as_deref(),
+            None,
+            "macOS 不应固定 utun 设备名，避免和系统已有 utun0/utun1 冲突"
+        );
+        assert_eq!(tun.auto_route, Some(true));
+        assert_ne!(tun.auto_redirect, Some(true));
+        assert_eq!(
+            tun.inet4_address,
+            vec!["172.19.0.1/30".to_string()],
+            "macOS TUN 地址不应落入 198.18.0.0/16 fake-ip 池，否则 mixed-port 可能被自路由重置"
+        );
+        assert_eq!(
+            document.typed.global.ipv6,
+            Some(false),
+            "默认只配置 IPv4 TUN 时应关闭全局 IPv6，避免浏览器用真实 IPv6 绕过 TUN"
+        );
+        assert_eq!(
+            document.typed.dns.as_ref().and_then(|dns| dns.ipv6),
+            Some(false),
+            "默认只配置 IPv4 TUN 时 DNS 不应返回 AAAA，避免浏览器优先走真实 IPv6"
+        );
     }
 
     #[test]
@@ -389,21 +474,27 @@ mod tests {
         assert_eq!(document.typed.global.mixed_port, Some(9870));
         assert_eq!(
             document.typed.global.external_controller.as_deref(),
-            Some("127.0.0.1:9090")
+            Some("127.0.0.1:19090")
         );
         assert_eq!(document.typed.global.geo_update_interval, Some(24));
+        assert_eq!(document.typed.global.ipv6, Some(false));
         assert_eq!(
             document.typed.dns.as_ref().and_then(|dns| dns.enable),
             Some(true)
         );
         assert_eq!(
-            document
-                .typed
-                .tun
-                .as_ref()
-                .and_then(|tun| tun.device.as_deref()),
-            Some("air")
+            document.typed.dns.as_ref().and_then(|dns| dns.ipv6),
+            Some(false)
         );
+        let tun_device = document
+            .typed
+            .tun
+            .as_ref()
+            .and_then(|tun| tun.device.as_deref());
+        #[cfg(target_os = "macos")]
+        assert_eq!(tun_device, None);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(tun_device, Some(DEFAULT_TUN_DEVICE));
         assert_eq!(
             document
                 .typed
@@ -420,10 +511,10 @@ mod tests {
     fn runtime_merge_only_allows_subscription_policy_sections() {
         let (temp, store) = store_in_temp();
         let mut base = store.load_user_config().unwrap().typed;
-        base.global.external_controller = Some("127.0.0.1:9090".to_string());
+        base.global.external_controller = Some("127.0.0.1:19090".to_string());
 
         let mut sub = MihomoConfigDocument::default();
-        sub.global.external_controller = Some("0.0.0.0:19090".to_string());
+        sub.global.external_controller = Some("0.0.0.0:9090".to_string());
         sub.proxies.push(ProxyNode {
             name: "sub-node".to_string(),
             kind: ProxyKind::Direct,
@@ -453,8 +544,8 @@ mod tests {
         let source =
             fs::read_to_string(temp.path().join("config/core.runtime.config.yaml")).unwrap();
         assert!(source.contains("sub-node"));
-        assert!(source.contains("127.0.0.1:9090"));
-        assert!(!source.contains("0.0.0.0:19090"));
+        assert!(source.contains("127.0.0.1:19090"));
+        assert!(!source.contains("0.0.0.0:9090"));
         assert!(!source.contains("null"));
     }
 }

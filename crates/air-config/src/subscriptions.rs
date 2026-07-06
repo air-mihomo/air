@@ -10,7 +10,10 @@ use std::fmt;
 use std::ops::Deref;
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::model::{MihomoConfigDocument, ProxyNode};
 
 use air_telemetry::redaction::redact_log_value;
 
@@ -456,6 +459,157 @@ pub enum SubscriptionUpdateOutcome {
     Failed,
     Imported,
     Canceled,
+}
+
+#[async_trait]
+pub trait SubscriptionUpdateCacheStore: Send + Sync {
+    async fn load_metadata(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Option<SubscriptionCacheMetadata>, SubscriptionPipelineError>;
+
+    async fn read_cached_content(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Option<Vec<u8>>, SubscriptionPipelineError>;
+
+    async fn record_update(
+        &self,
+        subscription_id: &str,
+        result: SubscriptionUpdateResult,
+        content: Option<&[u8]>,
+    ) -> Result<SubscriptionCacheMetadata, SubscriptionPipelineError>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedSubscription {
+    pub format: SubscriptionContentFormat,
+    pub document: MihomoConfigDocument,
+    pub proxies: Vec<ProxyNode>,
+    pub diagnostics: Vec<SubscriptionDiagnostic>,
+}
+
+impl ParsedSubscription {
+    /// Returns the content that should be persisted in subscription cache.
+    pub fn cache_content(
+        &self,
+        original_content: &str,
+    ) -> Result<Vec<u8>, SubscriptionPipelineError> {
+        match self.format {
+            SubscriptionContentFormat::MihomoYaml => Ok(original_content.as_bytes().to_vec()),
+            SubscriptionContentFormat::Base64Nodes => serde_yaml::to_string(&self.document)
+                .map(|yaml| yaml.into_bytes())
+                .map_err(|error| {
+                    SubscriptionPipelineError::InvalidResponse(vec![SubscriptionDiagnostic::error(
+                        "base64-cache-yaml",
+                        format!("base64 订阅转换后的 YAML 序列化失败: {error}"),
+                    )])
+                }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionContentFormat {
+    MihomoYaml,
+    Base64Nodes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SubscriptionDiagnostic {
+    pub severity: SubscriptionDiagnosticSeverity,
+    pub code: String,
+    pub message: String,
+}
+
+impl SubscriptionDiagnostic {
+    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: SubscriptionDiagnosticSeverity::Error,
+            code: code.into(),
+            message: redact_log_value(&message.into()),
+        }
+    }
+
+    pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: SubscriptionDiagnosticSeverity::Warning,
+            code: code.into(),
+            message: redact_log_value(&message.into()),
+        }
+    }
+}
+
+impl Default for SubscriptionDiagnostic {
+    fn default() -> Self {
+        Self {
+            severity: SubscriptionDiagnosticSeverity::Info,
+            code: String::new(),
+            message: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SubscriptionPipelineError {
+    #[error("订阅源已禁用: {0}")]
+    Disabled(String),
+    #[error("订阅请求无效: {0}")]
+    InvalidRequest(String),
+    #[error("订阅下载失败: {0}")]
+    Network(String),
+    #[error("订阅响应状态异常: {status}")]
+    HttpStatus {
+        status: u16,
+        diagnostics: Vec<SubscriptionDiagnostic>,
+    },
+    #[error("订阅响应无效")]
+    InvalidResponse(Vec<SubscriptionDiagnostic>),
+    #[error("订阅解析失败")]
+    Parse {
+        diagnostics: Vec<SubscriptionDiagnostic>,
+    },
+    #[error("订阅缓存失败: {0}")]
+    Cache(String),
+}
+
+impl SubscriptionPipelineError {
+    pub fn diagnostics(&self) -> Vec<SubscriptionDiagnostic> {
+        match self {
+            Self::Disabled(source_id) => vec![SubscriptionDiagnostic::error(
+                "subscription-disabled",
+                format!("订阅源已禁用: {source_id}"),
+            )],
+            Self::InvalidRequest(message) => {
+                vec![SubscriptionDiagnostic::error(
+                    "invalid-request",
+                    message.clone(),
+                )]
+            }
+            Self::Network(message) => vec![SubscriptionDiagnostic::error(
+                "network",
+                format!("订阅下载失败: {message}"),
+            )],
+            Self::HttpStatus { diagnostics, .. }
+            | Self::InvalidResponse(diagnostics)
+            | Self::Parse { diagnostics } => diagnostics.clone(),
+            Self::Cache(message) => vec![SubscriptionDiagnostic::error("cache", message.clone())],
+        }
+    }
+
+    pub fn safe_message(&self) -> String {
+        redact_log_value(&format!("{self:?} {self}"))
+    }
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]

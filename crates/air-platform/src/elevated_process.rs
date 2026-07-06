@@ -23,12 +23,22 @@ pub struct ElevatedProcessConfig {
 pub struct ElevatedChild {
     #[cfg(windows)]
     handle: isize,
+    #[cfg(unix)]
+    pid_file: Option<PathBuf>,
     pid: u32,
 }
 
 impl ElevatedChild {
     pub fn spawn(config: &ElevatedProcessConfig) -> AppResult<Self> {
         spawn_elevated_process(config)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn adopt_macos_pid(pid: u32) -> Self {
+        Self {
+            pid_file: None,
+            pid,
+        }
     }
 
     pub fn id(&self) -> u32 {
@@ -51,6 +61,11 @@ impl ElevatedChild {
     fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.handle as windows_sys::Win32::Foundation::HANDLE
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn terminate_macos_process_with_admin(pid: u32, timeout: Duration) -> AppResult<()> {
+    terminate_macos_pid(pid, timeout)
 }
 
 #[cfg(windows)]
@@ -109,11 +124,43 @@ fn spawn_elevated_process(config: &ElevatedProcessConfig) -> AppResult<ElevatedC
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn spawn_elevated_process(config: &ElevatedProcessConfig) -> AppResult<ElevatedChild> {
+    let pid_file = std::env::temp_dir().join(format!("air-mihomo-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pid_file);
+    if let Some(path) = &config.console_log_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(air_error::StorageError::Io)?;
+        }
+        prepare_managed_log_for_append(path).map_err(|error| {
+            PlatformError::OperationFailed(format!("准备核心日志文件失败: {error}"))
+        })?;
+    }
+
+    let shell_script = macos_elevated_shell_script(config, &pid_file);
+    let apple_script = macos_admin_osascript(&shell_script);
+    let status = run_macos_admin_osascript(&apple_script, "启动")?;
+    if !status.success() {
+        return Err(PlatformError::OperationFailed(format!(
+            "macOS 管理员授权被取消或核心启动失败，osascript={:?}。如果系统授权弹窗没有出现，请在终端运行 scripts/verify-macos-tun.sh --sudo 验证 TUN 权限。",
+            status.code()
+        ))
+        .into());
+    }
+
+    let pid = read_pid_file(&pid_file)?;
+    Ok(ElevatedChild {
+        pid_file: Some(pid_file),
+        pid,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn spawn_elevated_process(_config: &ElevatedProcessConfig) -> AppResult<ElevatedChild> {
     Err(PlatformError::Unsupported("当前平台不支持单独提权启动核心进程".into()).into())
 }
 
+#[cfg(any(windows, test))]
 fn elevated_core_helper_args(config: &ElevatedProcessConfig) -> Vec<String> {
     let mut args = vec![
         ELEVATED_CORE_HELPER_ARG.to_string(),
@@ -350,6 +397,237 @@ fn assign_child_to_kill_on_close_job(_child: &std::process::Child) -> Option<()>
     None
 }
 
+#[cfg(target_os = "macos")]
+fn read_pid_file(pid_file: &Path) -> AppResult<u32> {
+    let source = std::fs::read_to_string(pid_file).map_err(|error| {
+        PlatformError::OperationFailed(format!("读取提权核心 PID 文件失败: {error}"))
+    })?;
+    source.trim().parse::<u32>().map_err(|error| {
+        PlatformError::OperationFailed(format!("提权核心 PID 格式无效: {error}")).into()
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosSignal {
+    Probe,
+    Terminate,
+    Kill,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosSignal {
+    fn number(self) -> i32 {
+        match self {
+            Self::Probe => 0,
+            Self::Terminate => 15,
+            Self::Kill => 9,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Probe => "0",
+            Self::Terminate => "TERM",
+            Self::Kill => "KILL",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalOutcome {
+    Sent,
+    NoSuchProcess,
+    PermissionDenied,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosProcessProbe {
+    Running,
+    Exited,
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process(pid: u32, signal: MacosSignal) -> AppResult<SignalOutcome> {
+    const EPERM: i32 = 1;
+    const ESRCH: i32 = 3;
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    let pid = i32::try_from(pid).map_err(|_| {
+        PlatformError::OperationFailed(format!("提权核心 PID 超出 macOS 进程号范围: {pid}"))
+    })?;
+    let result = unsafe { kill(pid, signal.number()) };
+    if result == 0 {
+        return Ok(SignalOutcome::Sent);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(EPERM) => Ok(SignalOutcome::PermissionDenied),
+        Some(ESRCH) => Ok(SignalOutcome::NoSuchProcess),
+        _ => Err(PlatformError::OperationFailed(format!(
+            "发送进程信号失败: kill -{} {pid}: {error}",
+            signal.name()
+        ))
+        .into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_probe(pid: u32) -> AppResult<MacosProcessProbe> {
+    Ok(macos_process_probe_from_signal_outcome(signal_process(
+        pid,
+        MacosSignal::Probe,
+    )?))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_probe_from_signal_outcome(outcome: SignalOutcome) -> MacosProcessProbe {
+    match outcome {
+        SignalOutcome::Sent | SignalOutcome::PermissionDenied => MacosProcessProbe::Running,
+        SignalOutcome::NoSuchProcess => MacosProcessProbe::Exited,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_elevated_shell_script(config: &ElevatedProcessConfig, pid_file: &Path) -> String {
+    let mut env_prefix = String::new();
+    for (key, value) in &config.env {
+        env_prefix.push_str("export ");
+        env_prefix.push_str(key);
+        env_prefix.push('=');
+        env_prefix.push_str(&shell_quote(value));
+        env_prefix.push_str("; ");
+    }
+    let args = config
+        .args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let log_redirect = config
+        .console_log_path
+        .as_ref()
+        .map(|path| format!(" >> {} 2>&1", shell_quote(&path.to_string_lossy())))
+        .unwrap_or_else(|| " >/dev/null 2>&1".to_string());
+
+    format!(
+        "{route_cleanup} cd {cwd}; {env_prefix}{program} {args}{log_redirect} & echo $! > {pid_file}",
+        route_cleanup = macos_stale_route_cleanup_shell_script(),
+        cwd = shell_quote(&config.current_dir.to_string_lossy()),
+        program = shell_quote(&config.program.to_string_lossy()),
+        pid_file = shell_quote(&pid_file.to_string_lossy()),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_stale_route_cleanup_shell_script() -> &'static str {
+    "for air_route in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/16; do route -n delete -net \"$air_route\" 198.18.0.3 >/dev/null 2>&1 || true; done; route -n delete -host 198.18.0.3 198.18.0.1 >/dev/null 2>&1 || true;"
+}
+
+#[cfg(target_os = "macos")]
+fn macos_admin_osascript(shell_script: &str) -> String {
+    format!(
+        "do shell script {} with administrator privileges with prompt \"Air 需要管理员权限来启动或停止 mihomo TUN 模式。\"",
+        applescript_quote(shell_script)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_admin_osascript(
+    apple_script: &str,
+    action: &'static str,
+) -> AppResult<std::process::ExitStatus> {
+    let mut child = Command::new("osascript")
+        .arg("-e")
+        .arg(apple_script)
+        .spawn()
+        .map_err(|error| {
+            PlatformError::OperationFailed(format!(
+                "启动 macOS 管理员授权{action}核心失败: {error}"
+            ))
+        })?;
+    let started = std::time::Instant::now();
+    let timeout = macos_admin_authorization_timeout();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            PlatformError::OperationFailed(format!(
+                "等待 macOS 管理员授权{action}核心失败: {error}"
+            ))
+        })? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PlatformError::OperationFailed(macos_admin_timeout_message(action)).into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_admin_authorization_timeout() -> Duration {
+    std::env::var("AIR_MACOS_ADMIN_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(180))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_admin_timeout_message(action: &str) -> String {
+    format!(
+        "等待 macOS 管理员授权{action}核心超时。如果系统授权弹窗没有出现，请先在终端运行 scripts/verify-macos-tun.sh --sudo 验证 TUN 权限。"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_admin_signal_script(pid: u32, signal: MacosSignal) -> String {
+    macos_admin_osascript(&format!("kill -{} {pid}", signal.name()))
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_admin_signal(pid: u32, signal: MacosSignal) -> AppResult<()> {
+    let apple_script = macos_admin_signal_script(pid, signal);
+    let status = run_macos_admin_osascript(&apple_script, "停止")?;
+    if !status.success() {
+        return Err(PlatformError::OperationFailed(format!(
+            "macOS 管理员授权被取消或停止核心失败，osascript={:?}。如果系统授权弹窗没有出现，请在终端运行 scripts/verify-macos-tun.sh --sudo 验证 TUN 权限。",
+            status.code()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(windows)]
 struct JobHandle(isize);
 
@@ -385,7 +663,15 @@ fn elevated_try_wait(child: &ElevatedChild) -> AppResult<Option<Option<i32>>> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn elevated_try_wait(child: &ElevatedChild) -> AppResult<Option<Option<i32>>> {
+    match macos_process_probe(child.pid)? {
+        MacosProcessProbe::Running => Ok(None),
+        MacosProcessProbe::Exited => Ok(Some(None)),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn elevated_try_wait(_child: &ElevatedChild) -> AppResult<Option<Option<i32>>> {
     Err(PlatformError::Unsupported("当前平台不支持提权进程状态读取".into()).into())
 }
@@ -415,7 +701,22 @@ fn elevated_wait_timeout(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn elevated_wait_timeout(
+    child: &ElevatedChild,
+    timeout: Duration,
+) -> AppResult<Option<Option<i32>>> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(None)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn elevated_wait_timeout(
     _child: &ElevatedChild,
     _timeout: Duration,
@@ -438,7 +739,49 @@ fn elevated_kill(child: &ElevatedChild) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn elevated_kill(child: &ElevatedChild) -> AppResult<()> {
+    let result = terminate_macos_pid(child.pid, Duration::from_secs(2));
+    let _ = child.pid_file.as_ref().map(std::fs::remove_file);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_macos_pid(pid: u32, timeout: Duration) -> AppResult<()> {
+    match signal_process(pid, MacosSignal::Terminate)? {
+        SignalOutcome::Sent => {}
+        SignalOutcome::NoSuchProcess => {
+            return Ok(());
+        }
+        SignalOutcome::PermissionDenied => {
+            send_macos_admin_signal(pid, MacosSignal::Terminate)?;
+        }
+    };
+    if wait_macos_pid_exit(pid, timeout)?.is_none() {
+        match signal_process(pid, MacosSignal::Kill)? {
+            SignalOutcome::Sent | SignalOutcome::NoSuchProcess => {}
+            SignalOutcome::PermissionDenied => {
+                send_macos_admin_signal(pid, MacosSignal::Kill)?;
+            }
+        }
+        let _ = wait_macos_pid_exit(pid, Duration::from_secs(2))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn wait_macos_pid_exit(pid: u32, timeout: Duration) -> AppResult<Option<()>> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if matches!(macos_process_probe(pid)?, MacosProcessProbe::Exited) {
+            return Ok(Some(()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(None)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn elevated_kill(_child: &ElevatedChild) -> AppResult<()> {
     Err(PlatformError::Unsupported("当前平台不支持结束提权进程".into()).into())
 }
@@ -488,5 +831,99 @@ mod tests {
         let result = parse_elevated_core_helper_args(["--bad".to_string()]);
 
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_elevated_script_quotes_paths_args_and_env() {
+        let config = ElevatedProcessConfig {
+            program: PathBuf::from("/tmp/Air Test/mihomo's core"),
+            args: vec![
+                "-d".into(),
+                "/tmp/Air Data".into(),
+                "-f".into(),
+                "a'b.yaml".into(),
+            ],
+            env: BTreeMap::from([("SAFE_PATHS".into(), "/tmp/Air Data:/tmp/Other".into())]),
+            current_dir: PathBuf::from("/tmp/Air Data"),
+            console_log_path: Some(PathBuf::from("/tmp/Air Logs/core.log")),
+        };
+
+        let script = macos_elevated_shell_script(&config, Path::new("/tmp/air-core.pid"));
+
+        assert!(script.contains("cd '/tmp/Air Data'"));
+        assert!(script.contains("export SAFE_PATHS='/tmp/Air Data:/tmp/Other';"));
+        assert!(script.contains("'/tmp/Air Test/mihomo'\\''s core'"));
+        assert!(script.contains("'a'\\''b.yaml'"));
+        assert!(script.contains("echo $! > '/tmp/air-core.pid'"));
+        assert!(!script.contains("nohup"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_elevated_script_cleans_stale_mihomo_routes_before_starting_core() {
+        let config = ElevatedProcessConfig {
+            program: PathBuf::from("/tmp/mihomo"),
+            args: vec!["-d".into(), "/tmp/core".into()],
+            env: BTreeMap::new(),
+            current_dir: PathBuf::from("/tmp/core"),
+            console_log_path: None,
+        };
+
+        let script = macos_elevated_shell_script(&config, Path::new("/tmp/air-core.pid"));
+        let cleanup = macos_stale_route_cleanup_shell_script();
+        let cleanup_pos = script
+            .find(&cleanup)
+            .expect("elevated launch script should clean stale Air routes");
+        let program_pos = script
+            .find("'/tmp/mihomo'")
+            .expect("elevated launch script should start mihomo");
+
+        assert!(cleanup_pos < program_pos);
+        assert!(cleanup.contains("198.18.0.3"));
+        assert!(cleanup.contains("route -n delete -net"));
+        assert!(cleanup.contains("route -n delete -host 198.18.0.3"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_admin_osascript_escapes_shell_script_for_applescript() {
+        let command = macos_admin_osascript(r#"echo "hi" \ done"#);
+
+        assert_eq!(
+            command,
+            r#"do shell script "echo \"hi\" \\ done" with administrator privileges with prompt "Air 需要管理员权限来启动或停止 mihomo TUN 模式。""#
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_admin_timeout_message_points_to_terminal_sudo_verifier() {
+        let message = macos_admin_timeout_message("启动");
+
+        assert!(message.contains("等待 macOS 管理员授权启动核心超时"));
+        assert!(message.contains("scripts/verify-macos-tun.sh --sudo"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_probe_treats_permission_denied_as_running() {
+        assert_eq!(
+            macos_process_probe_from_signal_outcome(SignalOutcome::PermissionDenied),
+            MacosProcessProbe::Running
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_admin_signal_script_targets_pid_and_signal() {
+        assert_eq!(
+            macos_admin_signal_script(42, MacosSignal::Terminate),
+            r#"do shell script "kill -TERM 42" with administrator privileges with prompt "Air 需要管理员权限来启动或停止 mihomo TUN 模式。""#
+        );
+        assert_eq!(
+            macos_admin_signal_script(42, MacosSignal::Kill),
+            r#"do shell script "kill -KILL 42" with administrator privileges with prompt "Air 需要管理员权限来启动或停止 mihomo TUN 模式。""#
+        );
     }
 }

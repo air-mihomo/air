@@ -583,7 +583,15 @@ impl Render for Shell {
 }
 
 pub(super) fn app_ui_font() -> gpui::Font {
-    font(".SystemUIFont")
+    font(app_ui_font_family())
+}
+
+pub(super) fn app_ui_font_family() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Helvetica"
+    } else {
+        ".SystemUIFont"
+    }
 }
 
 pub(super) fn core_service_modal_button(

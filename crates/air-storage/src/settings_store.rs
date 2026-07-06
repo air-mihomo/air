@@ -131,6 +131,7 @@ mod tests {
         settings.autostart = true;
         settings.silent_start = true;
         settings.override_script_enabled = true;
+        settings.system_proxy_enabled = true;
         settings.proxy_delay_test_url = "https://probe.example.test/generate_204".into();
         settings.close_window_behavior = CloseWindowBehavior::Tray;
 
@@ -142,6 +143,7 @@ mod tests {
         assert!(source.contains("autostart = true"));
         assert!(source.contains("silent-start = true"));
         assert!(source.contains("override-script-enabled = true"));
+        assert!(source.contains("system-proxy-enabled = true"));
         assert!(
             source.contains("proxy-delay-test-url = \"https://probe.example.test/generate_204\"")
         );

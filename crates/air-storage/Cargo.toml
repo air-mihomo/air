@@ -10,7 +10,6 @@ publish = false
 [dependencies]
 air-config.workspace = true
 air-error.workspace = true
-air-mihomo.workspace = true
 air-settings.workspace = true
 async-trait.workspace = true
 directories.workspace = true

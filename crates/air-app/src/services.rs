@@ -26,6 +26,8 @@ use air_storage::{
 };
 use air_telemetry::redaction::redact_log_value;
 
+use crate::system_proxy_snapshot_store::SystemProxySnapshotStore;
+
 pub type AppMihomoService =
     MihomoService<MihomoRuntimeDetector, MihomoProcessManager, MihomoHttpClient>;
 
@@ -37,6 +39,7 @@ pub struct AppServices {
     pub core_config_store: Arc<CoreConfigStore>,
     pub subscription_store: Arc<SubscriptionStore>,
     pub override_script_store: Arc<OverrideScriptStore>,
+    pub system_proxy_snapshots: Arc<SystemProxySnapshotStore>,
     pub mihomo: Arc<AppMihomoService>,
     pub mihomo_clients: MihomoClientFactory,
     pub snapshots: AppStateStore,
@@ -99,7 +102,8 @@ impl AppServices {
             settings_store: Arc::clone(&settings_store),
             core_config_store: Arc::clone(&core_config_store),
             subscription_store: Arc::new(SubscriptionStore::new(paths.clone())),
-            override_script_store: Arc::new(OverrideScriptStore::new(paths)),
+            override_script_store: Arc::new(OverrideScriptStore::new(paths.clone())),
+            system_proxy_snapshots: Arc::new(SystemProxySnapshotStore::new(paths)),
             mihomo: Arc::new(MihomoService::new(detector, process, health_client)),
             mihomo_clients: MihomoClientFactory::new(Arc::clone(&core_config_store)),
             // AppSnapshot 是 UI 的只读投影；真实业务状态仍由 app/service/domain 持有。
@@ -387,6 +391,7 @@ impl AppServices {
             self.shutdown_stop_started.store(false, Ordering::Release);
             return Err(error);
         }
+        self.disable_system_proxy();
         Ok(())
     }
 
@@ -514,10 +519,181 @@ impl AppServices {
         Ok(apply_override_script(&subscription_name, &runtime, script)?)
     }
 
-    fn current_config_enables_tun(&self) -> AppResult<bool> {
+    pub fn current_config_enables_tun(&self) -> AppResult<bool> {
         Ok(document_enables_tun(
             &self.core_config_store.load_user_config()?,
         ))
+    }
+
+    pub fn current_mixed_port(&self) -> AppResult<Option<u32>> {
+        Ok(self.build_effective_runtime_config(None)?.global.mixed_port)
+    }
+
+    pub fn sync_system_proxy_to_current_config(&self) -> AppResult<()> {
+        if !self.load_settings()?.system_proxy_enabled {
+            tracing::info!("restoring system proxy because system proxy sync is disabled");
+            self.disable_system_proxy();
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!("skipping system proxy sync because current platform is unsupported");
+            return Ok(());
+        }
+
+        let Some(port) = self.current_mixed_port()? else {
+            tracing::info!("restoring system proxy because mixed-port is not configured");
+            self.disable_system_proxy();
+            return Ok(());
+        };
+        let snapshot = match self.ensure_system_proxy_snapshot(port) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, port, "failed to capture system proxy snapshot");
+                self.emit_notification(
+                    AppNotificationLevel::Warning,
+                    format!("系统代理原始状态保存失败：{error}"),
+                );
+                return Ok(());
+            }
+        };
+        match enable_local_system_proxy_for_runtime(port) {
+            Ok(update) => {
+                if snapshot.managed_port != port {
+                    let mut confirmed_snapshot = snapshot.clone();
+                    confirmed_snapshot.managed_port = port;
+                    if let Err(error) = self.system_proxy_snapshots.save(&confirmed_snapshot) {
+                        tracing::warn!(%error, port, "failed to confirm system proxy managed port");
+                        self.emit_notification(
+                            AppNotificationLevel::Warning,
+                            format!("系统代理托管状态保存失败：{error}"),
+                        );
+                        self.restore_system_proxy_after_failed_enable(&snapshot, port);
+                        return Ok(());
+                    }
+                }
+                tracing::info!(
+                    port,
+                    services = ?update.services,
+                    "system proxy synchronized to mihomo mixed-port"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, port, "failed to synchronize system proxy");
+                self.emit_notification(
+                    AppNotificationLevel::Warning,
+                    format!("系统代理同步失败：{error}"),
+                );
+                self.restore_system_proxy_after_failed_enable(&snapshot, port);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_system_proxy_snapshot(
+        &self,
+        port: u32,
+    ) -> AppResult<air_platform::system_proxy::SystemProxySnapshot> {
+        if let Some(snapshot) = self.system_proxy_snapshots.load()? {
+            tracing::debug!(
+                managed_port = snapshot.managed_port,
+                port,
+                "system proxy snapshot already exists"
+            );
+            return Ok(snapshot);
+        }
+
+        let snapshot = capture_system_proxy_snapshot_for_runtime(port)?;
+        self.system_proxy_snapshots.save(&snapshot)?;
+        tracing::info!(
+            port,
+            services = ?snapshot
+                .services
+                .iter()
+                .map(|service| service.service.as_str())
+                .collect::<Vec<_>>(),
+            "captured system proxy snapshot"
+        );
+        Ok(snapshot)
+    }
+
+    fn restore_system_proxy_after_failed_enable(
+        &self,
+        snapshot: &air_platform::system_proxy::SystemProxySnapshot,
+        attempted_port: u32,
+    ) {
+        let mut restore_failed = false;
+        let mut skipped_services = Vec::new();
+        if snapshot.managed_port != attempted_port {
+            let mut attempted_snapshot = snapshot.clone();
+            attempted_snapshot.managed_port = attempted_port;
+            match restore_system_proxy_snapshot_for_runtime(&attempted_snapshot) {
+                Ok(update) => skipped_services.extend(update.skipped_services),
+                Err(error) => {
+                    restore_failed = true;
+                    tracing::warn!(
+                        %error,
+                        attempted_port,
+                        "failed to restore partially updated system proxy after sync failure"
+                    );
+                }
+            }
+        }
+
+        match restore_system_proxy_snapshot_for_runtime(snapshot) {
+            Ok(update) => skipped_services.extend(update.skipped_services),
+            Err(error) => {
+                restore_failed = true;
+                tracing::warn!(%error, "failed to restore system proxy after sync failure");
+            }
+        }
+
+        if restore_failed || !skipped_services.is_empty() {
+            tracing::warn!(
+                skipped_services = ?skipped_services,
+                "kept system proxy snapshot because failed sync was not fully restored"
+            );
+            return;
+        }
+
+        if let Err(error) = self.system_proxy_snapshots.delete() {
+            tracing::warn!(%error, "failed to delete system proxy snapshot after failed sync restore");
+        }
+    }
+
+    pub fn disable_system_proxy(&self) {
+        let snapshot = match self.system_proxy_snapshots.load() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load system proxy snapshot before restore");
+                return;
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            match restore_system_proxy_snapshot_for_runtime(&snapshot) {
+                Ok(update) => {
+                    tracing::info!(
+                        restored_services = ?update.restored_services,
+                        skipped_services = ?update.skipped_services,
+                        "system proxy snapshot restored after mihomo stopped"
+                    );
+                    if update.skipped_services.is_empty() {
+                        if let Err(error) = self.system_proxy_snapshots.delete() {
+                            tracing::warn!(%error, "failed to delete restored system proxy snapshot");
+                        }
+                    } else {
+                        tracing::warn!(
+                            skipped_services = ?update.skipped_services,
+                            "kept system proxy snapshot because some services were not restored"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to restore system proxy snapshot");
+                }
+            }
+        }
     }
 
     fn subscription_merge_inputs(&self) -> AppResult<Vec<SubscriptionMergeInput>> {
@@ -701,7 +877,7 @@ impl MihomoClientFactory {
     pub fn endpoint_from_document(document: Option<&ConfigDocument>) -> MihomoEndpoint {
         let controller = document
             .and_then(|document| document.typed.global.external_controller.as_deref())
-            .unwrap_or("127.0.0.1:9090");
+            .unwrap_or("127.0.0.1:19090");
         MihomoEndpoint {
             base_url: normalize_controller_url(controller),
             secret: document
@@ -746,6 +922,70 @@ fn normalize_controller_url(value: &str) -> String {
     } else {
         format!("http://{trimmed}")
     }
+}
+
+#[cfg(not(test))]
+fn capture_system_proxy_snapshot_for_runtime(
+    port: u32,
+) -> AppResult<air_platform::system_proxy::SystemProxySnapshot> {
+    air_platform::system_proxy::capture_system_proxy_snapshot(port)
+}
+
+#[cfg(not(test))]
+fn enable_local_system_proxy_for_runtime(
+    port: u32,
+) -> AppResult<air_platform::system_proxy::SystemProxyUpdate> {
+    air_platform::system_proxy::enable_local_system_proxy(port)
+}
+
+#[cfg(test)]
+fn capture_system_proxy_snapshot_for_runtime(
+    port: u32,
+) -> AppResult<air_platform::system_proxy::SystemProxySnapshot> {
+    Ok(air_platform::system_proxy::SystemProxySnapshot {
+        managed_port: port,
+        services: vec![air_platform::system_proxy::SystemProxyServiceSnapshot {
+            service: "Wi-Fi".into(),
+            web: air_platform::system_proxy::MacosProxyState::default(),
+            secure_web: air_platform::system_proxy::MacosProxyState::default(),
+            socks: air_platform::system_proxy::MacosProxyState::default(),
+        }],
+    })
+}
+
+#[cfg(test)]
+fn enable_local_system_proxy_for_runtime(
+    port: u32,
+) -> AppResult<air_platform::system_proxy::SystemProxyUpdate> {
+    if port == 19091 {
+        return Err(
+            air_error::PlatformError::OperationFailed("test system proxy failure".into()).into(),
+        );
+    }
+    Ok(air_platform::system_proxy::SystemProxyUpdate {
+        services: vec!["Wi-Fi".into()],
+    })
+}
+
+#[cfg(not(test))]
+fn restore_system_proxy_snapshot_for_runtime(
+    snapshot: &air_platform::system_proxy::SystemProxySnapshot,
+) -> AppResult<air_platform::system_proxy::SystemProxyRestore> {
+    air_platform::system_proxy::restore_system_proxy_snapshot(snapshot)
+}
+
+#[cfg(test)]
+fn restore_system_proxy_snapshot_for_runtime(
+    snapshot: &air_platform::system_proxy::SystemProxySnapshot,
+) -> AppResult<air_platform::system_proxy::SystemProxyRestore> {
+    Ok(air_platform::system_proxy::SystemProxyRestore {
+        restored_services: snapshot
+            .services
+            .iter()
+            .map(|service| service.service.clone())
+            .collect(),
+        skipped_services: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -810,7 +1050,7 @@ mod tests {
         let running_options = services.detection_options().unwrap();
         assert_eq!(
             running_options.controller_addr.as_deref(),
-            Some("http://127.0.0.1:9090")
+            Some("http://127.0.0.1:19090")
         );
     }
 
@@ -958,6 +1198,159 @@ function override(subscriptionName, config) {
         assert_eq!(path, paths.config_dir.join("core.runtime.config.yaml"));
         assert!(runtime_config.contains("mixed-port: 19191"));
         assert!(runtime_config.contains("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn current_mixed_port_uses_effective_runtime_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths).unwrap();
+        services
+            .save_override_script(
+                r#"
+function override(subscriptionName, config) {
+  config["mixed-port"] = 19191;
+  return config;
+}
+"#,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(services.current_mixed_port().unwrap(), Some(19191));
+    }
+
+    #[test]
+    fn system_proxy_sync_captures_snapshot_once_and_updates_managed_port() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths.clone()).unwrap();
+        let mut settings = services.load_settings().unwrap();
+        settings.system_proxy_enabled = true;
+        services.save_settings(&settings).unwrap();
+
+        services.save_current_config("mixed-port: 9870\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+        let mut snapshot = services.system_proxy_snapshots.load().unwrap().unwrap();
+        snapshot.services[0].web.server = Some("proxy.example.test".into());
+        services.system_proxy_snapshots.save(&snapshot).unwrap();
+
+        services.save_current_config("mixed-port: 19090\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+        let updated = services.system_proxy_snapshots.load().unwrap().unwrap();
+
+        assert_eq!(updated.managed_port, 19090);
+        assert_eq!(
+            updated.services[0].web.server.as_deref(),
+            Some("proxy.example.test")
+        );
+        assert!(paths.data_dir.join("system-proxy-snapshot.json").exists());
+    }
+
+    #[test]
+    fn system_proxy_sync_is_opt_in_and_default_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths.clone()).unwrap();
+
+        services.save_current_config("mixed-port: 9870\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+
+        assert!(services.system_proxy_snapshots.load().unwrap().is_none());
+        assert!(!paths.data_dir.join("system-proxy-snapshot.json").exists());
+    }
+
+    #[test]
+    fn system_proxy_sync_disabled_restores_existing_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths.clone()).unwrap();
+        let snapshot = capture_system_proxy_snapshot_for_runtime(9870).unwrap();
+        services.system_proxy_snapshots.save(&snapshot).unwrap();
+
+        services.save_current_config("mixed-port: 9870\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+
+        assert!(services.system_proxy_snapshots.load().unwrap().is_none());
+        assert!(!paths.data_dir.join("system-proxy-snapshot.json").exists());
+    }
+
+    #[test]
+    fn system_proxy_sync_restores_and_deletes_snapshot_when_enable_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths).unwrap();
+        let mut settings = services.load_settings().unwrap();
+        settings.system_proxy_enabled = true;
+        services.save_settings(&settings).unwrap();
+        let mut snapshot = capture_system_proxy_snapshot_for_runtime(9870).unwrap();
+        snapshot.services[0].web.server = Some("proxy.example.test".into());
+        services.system_proxy_snapshots.save(&snapshot).unwrap();
+
+        services.save_current_config("mixed-port: 19091\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+
+        assert!(services.system_proxy_snapshots.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn system_proxy_sync_without_mixed_port_restores_and_deletes_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths.clone()).unwrap();
+        let mut settings = services.load_settings().unwrap();
+        settings.system_proxy_enabled = true;
+        services.save_settings(&settings).unwrap();
+        let snapshot = capture_system_proxy_snapshot_for_runtime(9870).unwrap();
+        services.system_proxy_snapshots.save(&snapshot).unwrap();
+
+        services.save_current_config("port: 9090\n").unwrap();
+        services.sync_system_proxy_to_current_config().unwrap();
+
+        assert!(services.system_proxy_snapshots.load().unwrap().is_none());
+        assert!(!paths.data_dir.join("system-proxy-snapshot.json").exists());
+    }
+
+    #[test]
+    fn disable_system_proxy_restores_snapshot_and_removes_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(
+            &temp.path().join("config"),
+            &temp.path().join("data"),
+            &temp.path().join("cache"),
+        );
+        let services = AppServices::with_paths(paths.clone()).unwrap();
+        let snapshot = capture_system_proxy_snapshot_for_runtime(9870).unwrap();
+        services.system_proxy_snapshots.save(&snapshot).unwrap();
+
+        services.disable_system_proxy();
+
+        assert!(services.system_proxy_snapshots.load().unwrap().is_none());
+        assert!(!paths.data_dir.join("system-proxy-snapshot.json").exists());
     }
 
     #[test]

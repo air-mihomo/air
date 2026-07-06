@@ -157,7 +157,9 @@ impl Shell {
             _appearance_subscription: appearance_subscription,
             _tray_handle: tray_handle,
             pending_commands: BTreeMap::new(),
+            pending_after_config_save: BTreeMap::new(),
             core_service_confirmation: None,
+            app_quit_requested: false,
         };
         shell.reconcile_traffic_monitoring();
         shell.reconcile_connections_monitoring_focus();
@@ -435,6 +437,29 @@ impl Shell {
         }
     }
 
+    pub(super) fn dispatch_command_after_config_save(
+        &mut self,
+        save_command: AppCommand,
+        after_save: Option<AppCommand>,
+    ) {
+        tracing::info!(
+            command_kind = save_command.kind(),
+            command_payload = %save_command.log_payload(),
+            "ui dispatching config save command to backend"
+        );
+        if let Some(router) = &self.command_router {
+            let id = router.dispatch(save_command.clone());
+            self.pending_commands.insert(id, save_command);
+            if let Some(after_save) = after_save {
+                self.pending_after_config_save.insert(id, after_save);
+            }
+        } else {
+            tracing::warn!(
+                "command router unavailable; config save command only recorded for diagnostics"
+            );
+        }
+    }
+
     pub(super) fn handle_tray_event(
         &mut self,
         event: TrayEvent,
@@ -547,12 +572,25 @@ impl Shell {
         let Some(router) = self.command_router.as_ref() else {
             return;
         };
-        // 閫€鍑烘敹灏剧洿鎺ユ帶鍒舵牳蹇冭繘绋嬶紱鍏堝彇娑堝悓涓€鏉?core 闀夸换鍔★紝闄嶄綆鍚姩/閲嶅惎鍛戒护涓?stop 骞跺彂鐨勬鐜囥€?        router.cancel_registered(&AppCommand::StopCore);
+        // 退出收尾直接控制核心进程；先取消同一条 core 长任务，降低启动/重启命令和 stop 并发的概率。
+        router.cancel_registered(&AppCommand::StartCore);
         if let Err(error) = router.services().stop_core_before_exit() {
             tracing::warn!(
                 %error,
                 "failed to stop mihomo core before app exit; continuing shutdown"
             );
         }
+    }
+
+    pub(super) fn request_app_quit(&mut self) {
+        self.app_quit_requested = true;
+        mark_app_quit_requested();
+    }
+
+    pub(super) fn should_close_window_for_intent(&self) -> bool {
+        should_close_window_for_intent(
+            self.settings.settings(),
+            self.app_quit_requested || app_quit_requested(),
+        )
     }
 }

@@ -1,29 +1,50 @@
 ﻿mod args;
+#[cfg(windows)]
 mod control;
+#[cfg(windows)]
 mod elevated;
+#[cfg(windows)]
 mod install;
 #[cfg(not(windows))]
 mod non_windows;
 mod types;
+#[cfg(windows)]
 mod windows_acl;
+#[cfg(windows)]
 mod worker;
 
 pub use args::service_binary_args;
+#[cfg(windows)]
 pub use control::{query_core_service, start_core_service, stop_core_service};
+#[cfg(windows)]
 pub use elevated::run_elevated_service_helper_from_env;
+#[cfg(windows)]
 pub use install::{install_core_service, uninstall_core_service};
+#[cfg(not(windows))]
+pub use non_windows::{
+    install_core_service, query_core_service, run_core_service_from_env,
+    run_elevated_service_helper_from_env, start_core_service, stop_core_service,
+    uninstall_core_service,
+};
 pub use types::{
     CORE_SERVICE_DISPLAY_NAME, CORE_SERVICE_NAME, CoreServiceAction, CoreServicePaths,
     CoreServiceSnapshot,
 };
+#[cfg(windows)]
 pub use worker::run_core_service_from_env;
 
 pub fn core_service_requested() -> bool {
     std::env::args().any(|arg| arg == types::CORE_SERVICE_ARG)
 }
 
+#[cfg(windows)]
 pub fn elevated_service_helper_requested() -> bool {
     std::env::args().any(|arg| arg == types::ELEVATED_SERVICE_HELPER_ARG)
+}
+
+#[cfg(not(windows))]
+pub fn elevated_service_helper_requested() -> bool {
+    false
 }
 
 pub fn core_service_required_for_admin_launch() -> bool {
@@ -76,6 +97,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn service_security_sddl_keeps_admin_delete_and_write_dac() {
         let sddl = windows_acl::core_service_security_sddl(None);
