@@ -3,10 +3,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ObjectFit, ParentElement, PathPromptOptions, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, StyledImage, Subscription, Window, WindowAppearance, WindowBounds, WindowOptions, div,
-    font, img, px, rgb, size,
+    App, AppContext, Context, Entity, Hsla, InteractiveElement, IntoElement, KeyBinding, Menu,
+    MenuItem, MouseButton, ObjectFit, ParentElement, PathPromptOptions, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, SystemMenuType, Window,
+    WindowAppearance, WindowBounds, WindowOptions, actions, div, font, img, px, rgb, size,
 };
 use gpui_component::input::{InputEvent, InputState, TabSize};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -43,6 +43,8 @@ const TITLE_BAR_SIDE_WIDTH: f32 = 160.0;
 const SUBSCRIPTION_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const TRAY_RESOURCE_RELEASE_DELAY: Duration = Duration::from_secs(3);
 const CODE_EDITOR_TAB_SIZE: usize = 4;
+
+actions!(air, [Quit]);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PageState {
@@ -222,7 +224,9 @@ pub struct Shell {
     _appearance_subscription: Subscription,
     _tray_handle: TrayHandle,
     pending_commands: BTreeMap<CommandId, AppCommand>,
+    pending_after_config_save: BTreeMap<CommandId, AppCommand>,
     core_service_confirmation: Option<CoreServiceConfirmation>,
+    app_quit_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,7 +307,72 @@ mod tests {
         should_dispatch_subscription_refresh, should_hide_window_on_startup,
         should_run_traffic_monitoring, should_start_core_on_startup,
     };
+    use crate::shell::render::app_ui_font_family;
     use air_mihomo::streams::StreamEvent;
+
+    #[test]
+    fn macos_ui_font_uses_concrete_core_text_family() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(app_ui_font_family(), "Helvetica");
+        } else {
+            assert_eq!(app_ui_font_family(), ".SystemUIFont");
+        }
+    }
+
+    #[test]
+    fn app_menu_exposes_quit_item_and_command_q_binding() {
+        let menus = lifecycle::app_menus();
+        assert_eq!(menus.len(), 1);
+        assert_eq!(menus[0].name.as_ref(), "Air");
+        assert!(
+            menus[0].items.iter().any(|item| {
+                matches!(
+                    item,
+                    MenuItem::Action { name, action, .. }
+                        if name.as_ref() == "退出 Air" && action.as_any().is::<Quit>()
+                )
+            }),
+            "app menu should include the Air quit action"
+        );
+
+        let binding = lifecycle::app_quit_key_binding();
+        assert!(binding.action().as_any().is::<Quit>());
+        assert_eq!(binding.keystrokes().len(), 1);
+        let keystroke = binding.keystrokes()[0].inner();
+        assert_eq!(keystroke.key, "q");
+        assert!(keystroke.modifiers.platform);
+    }
+
+    #[test]
+    fn explicit_quit_overrides_tray_close_behavior() {
+        let settings = AppSettings {
+            close_window_behavior: CloseWindowBehavior::Tray,
+            ..AppSettings::default()
+        };
+
+        assert!(lifecycle::should_close_window_for_intent(&settings, true));
+        assert!(!lifecycle::should_close_window_for_intent(&settings, false));
+    }
+
+    #[test]
+    fn status_tun_toggle_restarts_or_starts_after_config_save() {
+        assert!(matches!(
+            lifecycle::command_after_tun_config_save(&RuntimeStatus::Running),
+            Some(AppCommand::RestartCore)
+        ));
+        assert!(matches!(
+            lifecycle::command_after_tun_config_save(&RuntimeStatus::Idle),
+            Some(AppCommand::StartCore)
+        ));
+        assert!(matches!(
+            lifecycle::command_after_tun_config_save(&RuntimeStatus::Failed {
+                message: "failed".into()
+            }),
+            Some(AppCommand::StartCore)
+        ));
+        assert!(lifecycle::command_after_tun_config_save(&RuntimeStatus::Starting).is_none());
+        assert!(lifecycle::command_after_tun_config_save(&RuntimeStatus::Stopping).is_none());
+    }
 
     #[test]
     fn proxy_groups_empty_state_has_no_runtime_data() {

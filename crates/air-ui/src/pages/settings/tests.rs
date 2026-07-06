@@ -23,6 +23,7 @@ fn application_settings_only_keep_requested_fields() {
     state.set_theme(GuiThemePreference::Dark);
     state.toggle_bool(SettingsBoolField::StartCoreAfterLaunch);
     state.set_bool(SettingsBoolField::SilentStartup, true);
+    state.set_bool(SettingsBoolField::SystemProxy, true);
     state.set_bool(SettingsBoolField::HideToTray, true);
     state.set_text(
         SettingsTextField::ProxyDelayTestUrl,
@@ -32,6 +33,7 @@ fn application_settings_only_keep_requested_fields() {
     assert_eq!(state.settings().theme, GuiThemePreference::Dark);
     assert!(state.settings().start_core_after_launch);
     assert!(state.settings().silent_start);
+    assert!(state.settings().system_proxy_enabled);
     assert_eq!(
         state.settings().proxy_delay_test_url,
         "https://example.test/generate_204"

@@ -12,6 +12,7 @@ pub mod merge;
 pub mod model;
 pub mod override_script;
 pub mod sniffer;
+pub mod subscriptions;
 pub mod tun;
 pub mod yaml;
 
@@ -30,6 +31,7 @@ pub use model::MihomoConfigDocument;
 pub use override_script::{DEFAULT_OVERRIDE_SCRIPT, apply_override_script};
 pub use platform_kind::{PlatformKind, current_platform_kind};
 pub use sniffer::{SnifferConfigSettings, SnifferProtocolSettings};
+pub use subscriptions::*;
 pub use tun::TunConfigSettings;
 pub use yaml::{ConfigDocument, YamlConfigDocumentService};
 

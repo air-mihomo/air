@@ -58,6 +58,7 @@ pub(super) async fn handle_start_core(context: &CommandExecutionContext) -> AppR
     };
     tracing::info!(phase = ?status.phase, process = ?status.process, "core launch command completed");
     context.services.apply_mihomo_status(status);
+    context.services.sync_system_proxy_to_current_config()?;
     context.cancellations.remove("core");
     Ok(())
 }
@@ -80,6 +81,7 @@ pub(super) async fn handle_stop_core(context: &CommandExecutionContext) -> AppRe
     };
     tracing::info!(phase = ?status.phase, process = ?status.process, "core stop command completed");
     context.services.apply_mihomo_status(status);
+    context.services.disable_system_proxy();
     context.cancellations.remove("core");
     Ok(())
 }
@@ -87,20 +89,24 @@ pub(super) async fn handle_stop_core(context: &CommandExecutionContext) -> AppRe
 pub(super) async fn handle_restart_core(context: &CommandExecutionContext) -> AppResult<()> {
     ensure_not_canceled(&context.token)?;
     if runtime_is_running(&context.services) {
-        // 运行中重启优先走 mihomo 的快速 /restart；Windows 服务托管路径会在旧子进程退出后
-        // 保持服务和 JobObject 存活，让 mihomo 自身的后台重启不会被托管边界误杀。
-        context.services.write_runtime_config_validated().await?;
-        context
-            .services
-            .mihomo_clients
-            .client()?
-            .restart_core_default()
-            .await?;
-        context
-            .services
-            .emit_notification(AppNotificationLevel::Success, "内核重启请求已发送");
-        context.cancellations.remove("core");
-        return Ok(());
+        if context.services.current_config_enables_tun()? {
+            tracing::info!("restart requires admin; using managed full restart");
+        } else {
+            // 运行中重启优先走 mihomo 的快速 /restart；Windows 服务托管路径会在旧子进程退出后
+            // 保持服务和 JobObject 存活，让 mihomo 自身的后台重启不会被托管边界误杀。
+            context.services.write_runtime_config_validated().await?;
+            context
+                .services
+                .mihomo_clients
+                .client()?
+                .restart_core_default()
+                .await?;
+            context
+                .services
+                .emit_notification(AppNotificationLevel::Success, "内核重启请求已发送");
+            context.cancellations.remove("core");
+            return Ok(());
+        }
     }
     let config = context.services.launch_config().await?;
     if core_service_missing_for_admin_launch(context, config.requires_admin)? {
@@ -127,6 +133,7 @@ pub(super) async fn handle_restart_core(context: &CommandExecutionContext) -> Ap
         }
     };
     context.services.apply_mihomo_status(status);
+    context.services.sync_system_proxy_to_current_config()?;
     context.cancellations.remove("core");
     Ok(())
 }

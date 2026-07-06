@@ -87,9 +87,20 @@ fn current_process_is_elevated_impl() -> AppResult<bool> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn current_process_is_elevated_impl() -> AppResult<bool> {
-    Ok(true)
+    // macOS/Linux 的 TUN、路由和 DNS 劫持通常需要 root 权限；用 effective UID
+    // 判断当前进程能力，避免普通用户启动时误以为已经具备权限。
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    Ok(unsafe { geteuid() } == 0)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn current_process_is_elevated_impl() -> AppResult<bool> {
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -189,6 +200,23 @@ fn quote_windows_arg(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_elevated_check_matches_effective_uid() {
+        let expected = unsafe { geteuid() } == 0;
+
+        assert_eq!(
+            current_process_is_elevated().unwrap(),
+            expected,
+            "Unix 平台必须根据有效 UID 判断是否已具备 TUN 所需的 root 权限"
+        );
+    }
 
     #[test]
     fn windows_args_are_quoted_for_elevated_relaunch() {

@@ -14,6 +14,7 @@ pub struct AppSettings {
     pub autostart: bool,
     pub silent_start: bool,
     pub override_script_enabled: bool,
+    pub system_proxy_enabled: bool,
     pub proxy_delay_test_url: String,
     pub close_window_behavior: CloseWindowBehavior,
     pub window: WindowSettings,
@@ -29,6 +30,7 @@ impl Default for AppSettings {
             autostart: false,
             silent_start: false,
             override_script_enabled: false,
+            system_proxy_enabled: false,
             proxy_delay_test_url: DEFAULT_PROXY_DELAY_TEST_URL.to_string(),
             close_window_behavior: CloseWindowBehavior::Exit,
             window: WindowSettings::default(),
@@ -145,6 +147,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             autostart: LegacyAutostartValue,
             silent_start: Option<bool>,
             override_script_enabled: bool,
+            system_proxy_enabled: bool,
             proxy_delay_test_url: String,
             close_window_behavior: CloseWindowBehavior,
             window: WindowSettings,
@@ -161,6 +164,7 @@ impl<'de> Deserialize<'de> for AppSettings {
                     autostart: LegacyAutostartValue::Bool(defaults.autostart),
                     silent_start: None,
                     override_script_enabled: defaults.override_script_enabled,
+                    system_proxy_enabled: defaults.system_proxy_enabled,
                     proxy_delay_test_url: defaults.proxy_delay_test_url,
                     close_window_behavior: defaults.close_window_behavior,
                     window: defaults.window,
@@ -179,6 +183,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             // 旧版 `autostart = "silent"` 同时表达自启和静默启动；新版拆成两个字段后只在迁移时继承该语义。
             silent_start: compat.silent_start.unwrap_or(legacy_silent),
             override_script_enabled: compat.override_script_enabled,
+            system_proxy_enabled: compat.system_proxy_enabled,
             proxy_delay_test_url: compat.proxy_delay_test_url,
             close_window_behavior: compat.close_window_behavior,
             window: compat.window,
@@ -268,6 +273,7 @@ mod tests {
         assert!(!settings.autostart);
         assert!(!settings.silent_start);
         assert!(!settings.override_script_enabled);
+        assert!(!settings.system_proxy_enabled);
         assert_eq!(settings.proxy_delay_test_url, DEFAULT_PROXY_DELAY_TEST_URL);
         assert_eq!(settings.close_window_behavior, CloseWindowBehavior::Exit);
     }

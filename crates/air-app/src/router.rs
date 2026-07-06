@@ -387,7 +387,12 @@ mod tests {
 
     #[test]
     fn connections_monitoring_can_be_canceled_by_matching_command() {
+        let server = MonitoringStreamServer::spawn();
         let (_temp, router) = router_in_temp();
+        router
+            .services()
+            .save_current_config(&format!("external-controller: {}\n", server.base_addr))
+            .unwrap();
         router
             .services()
             .snapshots
@@ -938,6 +943,41 @@ mod tests {
     }
 
     #[test]
+    fn restart_core_running_tun_config_avoids_fast_restart_api() {
+        let server = ConnectionApiServer::spawn_with_request_sender();
+        let (_temp, router) = router_in_temp();
+        router
+            .services()
+            .save_current_config(&format!(
+                "external-controller: {}\ntun:\n  enable: true\n",
+                server.base_addr
+            ))
+            .unwrap();
+        router
+            .services()
+            .snapshots
+            .set_runtime_status(RuntimeStatus::Running);
+        let mut events = router.services().runtime.subscribe();
+
+        let id = router.dispatch(AppCommand::RestartCore);
+        let received = collect_until_finished(&mut events, id);
+
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event, AppEvent::UserVisibleError { .. })),
+            "missing core binary should fail before a controller /restart request is made"
+        );
+        assert!(
+            server
+                .requests
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "TUN restart must not use mihomo's non-elevated /restart endpoint"
+        );
+    }
+
+    #[test]
     fn closing_connection_refreshes_connections_state() {
         let server = ConnectionApiServer::spawn(vec![
             ("DELETE /connections/abc ", "{}"),
@@ -1389,6 +1429,11 @@ mod tests {
         base_addr: String,
     }
 
+    struct RecordingConnectionApiServer {
+        base_addr: String,
+        requests: mpsc::Receiver<String>,
+    }
+
     impl ConnectionApiServer {
         fn spawn(requests: Vec<(&'static str, &'static str)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("fake server should bind");
@@ -1417,6 +1462,33 @@ mod tests {
             });
             Self {
                 base_addr: format!("127.0.0.1:{}", addr.port()),
+            }
+        }
+
+        fn spawn_with_request_sender() -> RecordingConnectionApiServer {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("fake server should bind");
+            let addr = listener
+                .local_addr()
+                .expect("fake server addr should exist");
+            let (sender, requests) = mpsc::channel();
+            thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0_u8; 2048];
+                    let read = stream.read(&mut buffer).unwrap_or_default();
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let _ = sender.send(request);
+                    let body = r#"{"status":"ok"}"#;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(headers.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            });
+            RecordingConnectionApiServer {
+                base_addr: format!("127.0.0.1:{}", addr.port()),
+                requests,
             }
         }
     }

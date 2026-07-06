@@ -37,7 +37,7 @@ directories = "6"
 futures = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "196b9259b562c26be97c92f88c798bbeefa9cb3d", package = "gpui-component", default-features = false, features = ["tree-sitter-yaml", "tree-sitter-javascript"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "runtime_shaders"] }
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }

@@ -9,6 +9,7 @@ pub mod privilege;
 pub mod process;
 pub mod process_icon;
 pub mod single_instance;
+pub mod system_proxy;
 pub mod tray;
 pub mod window;
 

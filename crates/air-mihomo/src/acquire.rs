@@ -286,7 +286,7 @@ mod tests {
         assert!(
             service
                 .install_path_for("v1.19.0")
-                .ends_with("1.19.0\\mihomo.exe")
+                .ends_with(Path::new("1.19.0").join("mihomo.exe"))
         );
     }
 

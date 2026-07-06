@@ -37,7 +37,9 @@ pub(super) async fn reload_runtime_config_if_running(services: &AppServices) -> 
     // UI 保存的是用户配置；mihomo 运行时实际读取合并后的 runtime 配置。
     // 这里先重新生成 runtime 配置，再让核心通过 PUT /configs 重载当前配置路径。
     services.write_runtime_config_validated().await?;
-    reload_current_runtime_config_if_running(services).await
+    reload_current_runtime_config_if_running(services).await?;
+    services.sync_system_proxy_to_current_config()?;
+    Ok(())
 }
 
 pub(super) async fn reload_current_runtime_config_if_running(
